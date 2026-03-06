@@ -55,6 +55,15 @@ GOFLAGS=-mod=mod go install github.com/onsi/ginkgo/v2/ginkgo
 
 # Sync dependencies for test module (tests have their own go.mod)
 cd ..
+
+# Pin replace directive to the release branch being tested (../) instead of
+# main branch (../../base-repo) to avoid k8s dependency version mismatches
+# (e.g., structured-merge-diff/v4 vs v6 with openshift/client-go)
+PARENT_MODULE=$(grep "^module " ../go.mod 2>/dev/null | awk '{print $2}')
+if [ -n "$PARENT_MODULE" ]; then
+    go mod edit -replace="${PARENT_MODULE}=../"
+fi
+
 go mod tidy
 cd -
 
