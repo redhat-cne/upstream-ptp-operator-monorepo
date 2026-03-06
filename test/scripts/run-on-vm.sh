@@ -73,6 +73,19 @@ kubectl delete pods -l name=ptp-operator -n openshift-ptp
 # wait for operator to come up
 kubectl rollout status deployment ptp-operator -n openshift-ptp
 
+# Create local-sc StorageClass if it doesn't exist (kind uses rancher.io/local-path)
+if ! kubectl get storageclass local-sc &>/dev/null; then
+    kubectl apply -f - <<'SCEOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-sc
+provisioner: rancher.io/local-path
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+SCEOF
+fi
+
 # Patch ptpoperatorconfig - try with events config first, fall back to basic config for older releases
 if ! kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"ptpEventConfig": {"enableEventPublisher": true, "transportHost": "http://ptp-event-publisher-service-NODE_NAME.openshift-ptp.svc.cluster.local:9043", "storageType": "local-sc"}, "daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}' 2>/dev/null; then
     echo "Events config failed (may not be supported in this release), trying basic config..."
