@@ -1,0 +1,9 @@
+name: "linuxptp-daemon: Prow github actions"
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  prow:
+    uses: ./.github/workflows/_reusable-linuxptp-daemon-prow.yml
+    secrets: inherit

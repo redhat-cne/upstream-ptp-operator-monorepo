@@ -1,4 +1,4 @@
-LOCALBIN ?= $(shell pwd)/../bin
+LOCALBIN ?= $(shell pwd)/../../bin
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)/x86_64/
 
@@ -40,7 +40,7 @@ podman-push-%:
 
 build-image:
 	podman manifest create ${IMG_PREFIX}:$(VAR)
-	podman build --no-cache --platform $(PLATFORM) -f Dockerfile.$(VAR)  --manifest ${IMG_PREFIX}:$(VAR)  ..
+	podman build --no-cache --platform $(PLATFORM) -f Dockerfile.$(VAR)  --manifest ${IMG_PREFIX}:$(VAR)  ../..
 
 clean-image:
 	podman image rm ${IMG_PREFIX}:$(VAR) || true
@@ -52,8 +52,8 @@ podman-clean-%:
 podman-cleanall: $(foreach v, $(VALUES), podman-clean-$(v))
 
 deploy-all: 
-	./scripts/customize-env.sh ${IMG_PREFIX} ../config/manager
-	cd ../config/manager && $(KUSTOMIZE) edit set image controller=${IMG_PREFIX}:ptpop
-	$(KUSTOMIZE) build ../config/default | kubectl apply -f -
-	$(KUSTOMIZE) build ../config/custom | kubectl apply -f -
+	./scripts/customize-env.sh ${IMG_PREFIX} ../../config/manager
+	cd ../../config/manager && $(KUSTOMIZE) edit set image controller=${IMG_PREFIX}:ptpop
+	$(KUSTOMIZE) build ../../config/default | kubectl apply -f -
+	$(KUSTOMIZE) build ../../config/custom | kubectl apply -f -
 	kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"ptpEventConfig": {"enableEventPublisher": true, "transportHost": "http://ptp-event-publisher-service-NODE_NAME.openshift-ptp.svc.cluster.local:9043", "storageType": "local-sc"}, "daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}'

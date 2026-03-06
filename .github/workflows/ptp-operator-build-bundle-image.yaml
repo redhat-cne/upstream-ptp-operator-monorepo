@@ -1,0 +1,15 @@
+name: "ptp-operator: Deploy Bundle Images to GHCR"
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  build-bundle:
+    uses: ./.github/workflows/_reusable-ptp-operator-build-bundle-image.yml
+    secrets: inherit

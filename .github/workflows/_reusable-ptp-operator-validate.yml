@@ -1,12 +1,12 @@
-name: Validate
-
-on: [push, pull_request]
+name: "Reusable: ptp-operator Validate"
+on:
+  workflow_call:
 
 jobs:
   test:
     strategy:
       matrix:
-        go-version: [1.23.x]  # Use valid versions
+        go-version: [1.23.x]
         os: [ubuntu-latest]
 
     runs-on: ${{ matrix.os }}
@@ -21,13 +21,18 @@ jobs:
           go-version: ${{ matrix.go-version }}
 
       - name: Install Dependencies
-        run: go mod tidy && go mod download
+        run: go mod tidy && go mod vendor
 
       - name: Run vet
         run: make vet
-        
+
       - name: Run fmt
-        run: make fmt 
+        run: make fmt
 
       - name: Bundle check
-        run: make bundle-check
+        run: |
+          if make -n bundle-check >/dev/null 2>&1; then
+            make bundle-check
+          else
+            echo "Skipping: bundle-check target not available in this branch"
+          fi

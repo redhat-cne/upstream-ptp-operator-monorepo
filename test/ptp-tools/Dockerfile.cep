@@ -1,5 +1,5 @@
 FROM docker.io/golang:1.24.3 AS builder
-ENV GO111MODULE=off
+ENV GO111MODULE=on
 ENV CGO_ENABLED=1
 ENV COMMON_GO_ARGS=-race
 ENV GOOS=linux
@@ -7,7 +7,8 @@ ENV GOPATH=/go
 ENV GOMAXPROCS=16
 
 WORKDIR /go/src/github.com/redhat-cne/cloud-event-proxy
-RUN git clone -b main https://github.com/redhat-cne/cloud-event-proxy.git /go/src/github.com/redhat-cne/cloud-event-proxy
+# Copy from local monorepo subdirectory
+COPY pkg/cloud-event-proxy/ .
 
 RUN hack/build-go.sh
 

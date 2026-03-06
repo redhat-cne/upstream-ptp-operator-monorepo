@@ -9,6 +9,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 echo "Now in: $(pwd)"
 
+# Ensure Go modules mode is always used
+export GO111MODULE=on
 export GOMAXPROCS=$(nproc)
 
 source ./install-tools.sh
@@ -38,7 +40,7 @@ make -j 5 podman-buildall
 cd -
 
 # build kustomize
-cd ..
+cd ../..
 make kustomize
 cd -
 ./create-local-registry.sh "$VM_IP"
@@ -71,8 +73,15 @@ kubectl delete pods -l name=ptp-operator -n openshift-ptp
 # wait for operator to come up
 kubectl rollout status deployment ptp-operator -n openshift-ptp
 
-# Patch ptpoperatorconfig to start events (in case it is not configured yet )
-./retry.sh 60 5 kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"ptpEventConfig": {"enableEventPublisher": true, "transportHost": "http://ptp-event-publisher-service-NODE_NAME.openshift-ptp.svc.cluster.local:9043", "storageType": "local-sc"}, "daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}'
+# Patch ptpoperatorconfig - try with events config first, fall back to basic config for older releases
+if ! kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"ptpEventConfig": {"enableEventPublisher": true, "transportHost": "http://ptp-event-publisher-service-NODE_NAME.openshift-ptp.svc.cluster.local:9043", "storageType": "local-sc"}, "daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}' 2>/dev/null; then
+    echo "Events config failed (may not be supported in this release), trying basic config..."
+    # Try without storageType for releases that don't support it
+    if ! kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"ptpEventConfig": {"enableEventPublisher": true, "transportHost": "http://ptp-event-publisher-service-NODE_NAME.openshift-ptp.svc.cluster.local:9043"}, "daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}' 2>/dev/null; then
+        echo "Events config not supported, using basic daemonNodeSelector only..."
+        kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}'
+    fi
+fi
 
 ./retry.sh 30 3 kubectl rollout status ds linuxptp-daemon -n openshift-ptp
 
