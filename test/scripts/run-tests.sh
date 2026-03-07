@@ -64,6 +64,17 @@ if [ -n "$PARENT_MODULE" ]; then
     go mod edit -replace="${PARENT_MODULE}=../"
 fi
 
+# Drop pinned k8s/openshift versions so go mod tidy resolves them
+# from the parent module's dependency graph (ensures version consistency)
+rm -f go.sum
+for dep in github.com/openshift/client-go github.com/openshift/api \
+           github.com/openshift/library-go \
+           k8s.io/api k8s.io/apimachinery k8s.io/client-go \
+           k8s.io/apiextensions-apiserver k8s.io/utils k8s.io/component-base \
+           sigs.k8s.io/controller-runtime sigs.k8s.io/structured-merge-diff/v4; do
+    go mod edit -droprequire="$dep" 2>/dev/null || true
+done
+
 go mod tidy
 cd -
 
