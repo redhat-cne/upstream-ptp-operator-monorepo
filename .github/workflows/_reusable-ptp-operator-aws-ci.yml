@@ -140,34 +140,6 @@ jobs:
           echo "Using tests from main branch"
           rm -rf ptp-operator/test
           cp -r base-repo/test ptp-operator/test
-          
-          # Get the target module path from the PR's go.mod
-          TARGET_MODULE=$(grep "^module " ptp-operator/go.mod | awk '{print $2}')
-          SOURCE_MODULE="github.com/k8snetworkplumbingwg/ptp-operator"
-          
-          # Update test module if parent module path differs
-          if [ "$TARGET_MODULE" != "$SOURCE_MODULE" ]; then
-            echo "Updating test module for: $SOURCE_MODULE -> $TARGET_MODULE"
-            
-            # Update ALL occurrences of source module in test/go.mod (module name, replace, require)
-            sed -i "s|$SOURCE_MODULE|$TARGET_MODULE|g" ptp-operator/test/go.mod
-            
-            # go.sum is NOT deleted: it contains only external dep checksums
-            # (zero entries for ptp-operator), so the module path change above
-            # does not invalidate any go.sum entries.  Preserving go.sum prevents
-            # go mod tidy from doing a fresh resolution that pulls in
-            # structured-merge-diff/v6 (incompatible with the v4 stack).
-            
-            # Update imports in Go files to use the correct module paths
-            find ptp-operator/test -name "*.go" -exec sed -i "s|$SOURCE_MODULE|$TARGET_MODULE|g" {} \;
-            
-            # Update api/ and pkg/ imports in base-repo (these will be copied after build)
-            find base-repo/api base-repo/pkg -name "*.go" -exec sed -i "s|$SOURCE_MODULE|$TARGET_MODULE|g" {} \; 2>/dev/null || true
-          fi
-          
-          # Note: api/ and pkg/ from base-repo will be copied to ptp-operator on the VM
-          # after the build completes, to ensure test compatibility with latest controller-runtime
-          
 
           # Send both ptp-operator and base-repo to VM
           rsync -r -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" ptp-operator base-repo fedora@"$public_ip":~/.
