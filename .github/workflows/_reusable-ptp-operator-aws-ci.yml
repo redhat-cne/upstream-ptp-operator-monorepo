@@ -152,8 +152,11 @@ jobs:
             # Update ALL occurrences of source module in test/go.mod (module name, replace, require)
             sed -i "s|$SOURCE_MODULE|$TARGET_MODULE|g" ptp-operator/test/go.mod
             
-            # Delete go.sum - it has checksums for wrong module, go mod tidy will regenerate
-            rm -f ptp-operator/test/go.sum
+            # go.sum is NOT deleted: it contains only external dep checksums
+            # (zero entries for ptp-operator), so the module path change above
+            # does not invalidate any go.sum entries.  Preserving go.sum prevents
+            # go mod tidy from doing a fresh resolution that pulls in
+            # structured-merge-diff/v6 (incompatible with the v4 stack).
             
             # Update imports in Go files to use the correct module paths
             find ptp-operator/test -name "*.go" -exec sed -i "s|$SOURCE_MODULE|$TARGET_MODULE|g" {} \;
