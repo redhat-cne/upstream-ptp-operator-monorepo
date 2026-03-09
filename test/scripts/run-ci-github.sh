@@ -19,7 +19,17 @@ GOFLAGS=-mod=mod go install github.com/onsi/ginkgo/v2/ginkgo
 
 # Sync dependencies for test module (tests have their own go.mod)
 cd ..
+
+# Point replace at the release branch being tested (../) instead of the
+# main branch (../../base-repo).  Preserve go.sum and all existing requires
+# to prevent go mod tidy from pulling in structured-merge-diff/v6 via a
+# fresh resolution (all downstream branches pin the same k8s v0.28.3 stack).
+PARENT_MODULE=$(grep "^module " ../go.mod 2>/dev/null | awk '{print $2}')
+if [ -n "$PARENT_MODULE" ]; then
+    go mod edit -replace="${PARENT_MODULE}=../"
+fi
 go mod tidy
+
 cd -
 
 # Use mod mode for tests - test module has its own go.mod

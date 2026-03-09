@@ -56,26 +56,16 @@ GOFLAGS=-mod=mod go install github.com/onsi/ginkgo/v2/ginkgo
 # Sync dependencies for test module (tests have their own go.mod)
 cd ..
 
-# Pin replace directive to the release branch being tested (../) instead of
-# main branch (../../base-repo) to avoid k8s dependency version mismatches
-# (e.g., structured-merge-diff/v4 vs v6 with openshift/client-go)
+# Point replace at the release branch being tested (../) instead of the
+# main branch (../../base-repo).  Preserve go.sum and all existing requires
+# to prevent go mod tidy from pulling in structured-merge-diff/v6 via a
+# fresh resolution (all downstream branches pin the same k8s v0.28.3 stack).
 PARENT_MODULE=$(grep "^module " ../go.mod 2>/dev/null | awk '{print $2}')
 if [ -n "$PARENT_MODULE" ]; then
     go mod edit -replace="${PARENT_MODULE}=../"
 fi
-
-# Drop pinned k8s/openshift versions so go mod tidy resolves them
-# from the parent module's dependency graph (ensures version consistency)
-rm -f go.sum
-for dep in github.com/openshift/client-go github.com/openshift/api \
-           github.com/openshift/library-go \
-           k8s.io/api k8s.io/apimachinery k8s.io/client-go \
-           k8s.io/apiextensions-apiserver k8s.io/utils k8s.io/component-base \
-           sigs.k8s.io/controller-runtime sigs.k8s.io/structured-merge-diff/v4; do
-    go mod edit -droprequire="$dep" 2>/dev/null || true
-done
-
 go mod tidy
+
 cd -
 
 # Use mod mode for tests - test module has its own go.mod
