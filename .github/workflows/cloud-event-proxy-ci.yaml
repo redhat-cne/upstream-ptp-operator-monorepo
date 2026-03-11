@@ -1,0 +1,12 @@
+name: "cloud-event-proxy: CI"
+on:
+  push:
+    paths:
+      - 'pkg/cloud-event-proxy/**'
+  pull_request:
+    paths:
+      - 'pkg/cloud-event-proxy/**'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/_reusable-cloud-event-proxy-ci.yml

@@ -46,11 +46,14 @@ fi
 export BASHRCSOURCED=1
 source ~/.bashrc
 
-# Install ginkgo
+# Ensure Go modules mode is always used
+export GO111MODULE=on
+
+# Install ginkgo (use -mod=mod since vendor directory may exist)
 go mod tidy
 go mod vendor
-go install github.com/onsi/ginkgo/v2/ginkgo
-go get github.com/onsi/gomega/...
+GOFLAGS=-mod=mod go install github.com/onsi/ginkgo/v2/ginkgo
+GOFLAGS=-mod=mod go get github.com/onsi/gomega/...
 
 # Install kind
 if [[ "$ARCH" == "x86_64" ]]; then

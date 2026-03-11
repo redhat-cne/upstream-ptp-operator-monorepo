@@ -1,0 +1,17 @@
+name: "linuxptp-daemon: golangci-lint"
+on:
+  push:
+    branches: ["main", "one-repo*", "release-*"]
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+  pull_request:
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  lint:
+    uses: ./.github/workflows/_reusable-linuxptp-daemon-linter.yml

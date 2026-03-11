@@ -1,0 +1,13 @@
+name: "cloud-event-proxy: Build and Push Consumer Image"
+on:
+  push:
+    branches: [main, release-4.18]
+    paths:
+      - 'pkg/cloud-event-proxy/**'
+
+jobs:
+  build:
+    uses: ./.github/workflows/_reusable-cloud-event-proxy-build.yml
+    with:
+      version: ${{ github.ref_name == 'main' && 'latest' || github.ref_name == 'release-4.18' && '4.18' || 'unknown' }}
+    secrets: inherit

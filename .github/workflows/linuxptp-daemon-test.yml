@@ -1,0 +1,13 @@
+name: "linuxptp-daemon: Test"
+on:
+  push:
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+  pull_request:
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+
+jobs:
+  test:
+    uses: ./.github/workflows/_reusable-linuxptp-daemon-test.yml
+    secrets: inherit

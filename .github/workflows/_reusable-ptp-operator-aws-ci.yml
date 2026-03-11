@@ -1,0 +1,207 @@
+name: "Reusable: ptp-operator CI tests AWS"
+on:
+  workflow_call:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name }}-${{ github.event.pull_request.head.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-ec2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    steps:
+      - name: Remove ok-to-test label if new commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = "ok-to-test";
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const labels = pr.labels.map(l => l.name);
+
+            if (!labels.includes(label)) {
+              core.setFailed(`Missing required '${label}' label. PR is not ok to test.`);
+              return;
+            }
+            console.log(`eventName='${context.eventName}', action='${context.payload.action}'.`)
+            // Only remove the label if this is a new commit
+            if (context.eventName === 'pull_request_target' && context.payload.action === 'synchronize') {
+              await github.rest.issues.removeLabel({
+                owner,
+                repo,
+                issue_number: pr.number,
+                name: label,
+              });
+              core.setFailed(`Removed '${label}' due to new push to PR. Please add new ok-to-test label to test.`);
+            } else {
+              console.log(`Label '${label}' found — code not changed, still ok to test.`);
+            }
+
+      - name: Checkout the code from the user fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          path: ptp-operator
+
+      - name: Checkout helper files from base repo
+        uses: actions/checkout@v4
+        with:
+          repository: redhat-cne/upstream-ptp-operator-monorepo
+          ref: main
+          sparse-checkout: |
+            ptp-tools
+            scripts
+            hack
+            test
+            api
+            pkg
+          path: base-repo
+
+      - name: Debug OIDC Token
+        run: |
+          echo "=== GitHub Context for OIDC Debug ==="
+          echo "repository: ${{ github.repository }}"
+          echo "repository_owner: ${{ github.repository_owner }}"
+          echo "ref: ${{ github.ref }}"
+          echo "ref_name: ${{ github.ref_name }}"
+          echo "workflow: ${{ github.workflow }}"
+          echo "workflow_ref: ${{ github.workflow_ref }}"
+          echo "job: ${{ github.job }}"
+          echo "event_name: ${{ github.event_name }}"
+          echo "actor: ${{ github.actor }}"
+          echo "=================================="
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::939345161466:role/github-oidc-setup-david-Role-8DcbDlLGfv4O
+          role-session-name: ${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Launch EC2 instance
+        id: launch
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ami-0e1ffb55cf14ba471 \
+            --subnet-id subnet-03e8151444372854e\
+            --instance-type m6a.xlarge \
+            --security-group-ids sg-0f20fd004e72616d3 \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ptp-operator PR-${{ github.event.number }}-${{ github.actor }}},{Key=ci-job-fullname,Value=PR-${{ github.event.number }}-${{ github.actor }}},{Key=ci-org-name,Value=${{ github.event.pull_request.head.repo.owner.login }}},{Key=ci-repo-name,Value=${{ github.event.pull_request.head.repo.name }}},{Key=ci-job-source,Value=k8ci},{Key=ci-job-branch,Value=${{ github.event.pull_request.head.ref }}},{Key=ci-job-type,Value=ptp-test}]' \
+            --query 'Instances[0].InstanceId' \
+            --key-name ptp-sshkey-1 \
+            --output text)
+
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_ENV
+
+      - name: Wait for instance and get public IP
+        id: wait
+        run: |
+          aws ec2 wait instance-running --instance-ids $instance_id
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids $instance_id \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_ENV
+          PRIVATE_IP=$(aws ec2 describe-instances \
+            --instance-ids $instance_id \
+            --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+            --output text)
+          echo "private_ip=$PRIVATE_IP" >> $GITHUB_ENV
+
+      - name: Wait for instance to be online
+        run: |
+          ./base-repo/scripts/retry.sh 180 10 sh -c "aws ssm describe-instance-information --query \"InstanceInformationList[?InstanceId=='$instance_id'].PingStatus\" --output text | grep -q 'Online'"
+
+      - name: Run test script
+        run: |
+          echo "VM IP is $public_ip"
+          eval "$(ssh-agent -s)"
+          ssh-keygen -t rsa -b 4096 -f temp_key -N ""
+          aws ssm send-command --instance-ids $instance_id \
+              --document-name "AWS-RunShellScript" \
+              --parameters 'commands=["sudo bash -c '\''echo '"$(cat temp_key.pub)"' >> /home/fedora/.ssh/authorized_keys'\''"]'
+
+          ssh-add temp_key
+
+          ./base-repo/scripts/retry.sh 60 5 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null fedora@"$public_ip" uptime
+
+          # Copy scripts, ptp-tools, and hack from base repo to ptp-operator in case they don't exist in older branches
+          mkdir -p ptp-operator/scripts
+          cp -rf base-repo/scripts/* ptp-operator/scripts/
+          
+          # Copy ptp-tools from upstream (has monorepo Dockerfile fixes)
+          rm -rf ptp-operator/ptp-tools
+          cp -r base-repo/ptp-tools ptp-operator/ptp-tools
+          
+          # Copy hack directory (contains build.sh with Go modules fixes)
+          mkdir -p ptp-operator/hack
+          cp -f base-repo/hack/* ptp-operator/hack/ 2>/dev/null || true
+          
+          # Always copy test directory from main branch (has its own go.mod)
+          echo "Using tests from main branch"
+          rm -rf ptp-operator/test
+          cp -r base-repo/test ptp-operator/test
+          
+          # test/go.mod defaults to replace => .. (monorepo root); rewrite to ../../base-repo for CI layout
+          sed -i 's|=> \.\.$|=> ../../base-repo|' ptp-operator/test/go.mod
+
+          # Get the target module path from the PR's go.mod
+          TARGET_MODULE=$(grep "^module " ptp-operator/go.mod | awk '{print $2}')
+          SOURCE_MODULE="github.com/k8snetworkplumbingwg/ptp-operator"
+          
+          # Update test module if parent module path differs
+          if [ "$TARGET_MODULE" != "$SOURCE_MODULE" ]; then
+            echo "Updating test module for: $SOURCE_MODULE -> $TARGET_MODULE"
+            
+            # Update ALL occurrences of source module in test/go.mod (module name, replace, require)
+            sed -i "s|$SOURCE_MODULE|$TARGET_MODULE|g" ptp-operator/test/go.mod
+            
+            # Delete go.sum - it has checksums for wrong module, go mod tidy will regenerate
+            rm -f ptp-operator/test/go.sum
+            
+            # Update imports in Go files to use the correct module paths
+            find ptp-operator/test -name "*.go" -exec sed -i "s|$SOURCE_MODULE|$TARGET_MODULE|g" {} \;
+            
+            # Update api/ and pkg/ imports in base-repo (these will be copied after build)
+            find base-repo/api base-repo/pkg -name "*.go" -exec sed -i "s|$SOURCE_MODULE|$TARGET_MODULE|g" {} \; 2>/dev/null || true
+          fi
+          
+          # Note: api/ and pkg/ from base-repo will be copied to ptp-operator on the VM
+          # after the build completes, to ensure test compatibility with latest controller-runtime
+          
+
+          # Send both ptp-operator and base-repo to VM
+          rsync -r -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" ptp-operator base-repo fedora@"$public_ip":~/.
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ServerAliveInterval=60 \
+              -o ServerAliveCountMax=10 \
+              -o ConnectTimeout=30 \
+              -o TCPKeepAlive=yes \
+              fedora@"$public_ip" \
+              "set +e; \
+              sudo ./ptp-operator/scripts/run-on-vm.sh '$private_ip'; \
+              exit_code=\$?; \
+              echo '=== Script completed with exit code:' \$exit_code '==='; \
+              echo '=== Recent system logs ==='; \
+              sudo journalctl --no-pager -n 100 --since '5 minutes ago'; \
+              echo '=== End of logs ==='; \
+              exit \$exit_code"
+
+      - name: Cleanup - Delete EC2 instance
+        if: always()
+        run: |
+          echo "Cleaning up EC2 INSTANCE_ID=$instance_id"
+          aws ec2 terminate-instances --instance-ids $instance_id
+
+      - name: Notify cleanup complete
+        run: echo "Cleanup task completed."
