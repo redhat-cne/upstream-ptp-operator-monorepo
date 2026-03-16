@@ -30,4 +30,9 @@ jobs:
         run: make fmt
 
       - name: Bundle check
-        run: make bundle-check
+        run: |
+          if make -n bundle-check >/dev/null 2>&1; then
+            make bundle-check
+          else
+            echo "Skipping: bundle-check target not available in this branch"
+          fi
