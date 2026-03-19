@@ -1,0 +1,72 @@
+name: "Reusable: ptp-operator Validate"
+on:
+  workflow_call:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        go-version: [1.23.x]
+        os: [ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Install Dependencies
+        run: go mod tidy && go mod vendor
+
+      - name: Baseline working tree
+        run: |
+          git config user.email "ci@ci.local"
+          git config user.name "CI"
+          git add -A
+          git diff --cached --quiet || git commit --no-verify -m "CI: baseline"
+
+      - name: Run vet
+        run: make vet
+
+      - name: Run fmt
+        run: make fmt
+
+      - name: Checkout upstream hack scripts
+        uses: actions/checkout@v4
+        with:
+          repository: redhat-cne/upstream-ptp-operator-monorepo
+          ref: main
+          sparse-checkout: hack
+          path: _upstream
+
+      - name: Copy upstream hack scripts
+        run: |
+          cp -rf _upstream/hack/* hack/ 2>/dev/null || true
+          rm -rf _upstream
+          git add -A
+          git diff --cached --quiet || git commit --no-verify -m "CI: sync hack from upstream"
+
+      - name: Bundle check
+        run: |
+          if [ -d test ]; then
+            mv test /tmp/_test_backup
+          fi
+          make common-deps-update 2>/dev/null || true
+          make generate 2>/dev/null || true
+          make manifests 2>/dev/null || true
+          make bundle 2>/dev/null || true
+          git add -A
+          git diff --cached --quiet || git commit --no-verify -m "CI: baseline generated"
+          make common-deps-update 2>/dev/null || true
+          make generate 2>/dev/null || true
+          make manifests 2>/dev/null || true
+          make bundle 2>/dev/null || true
+          hack/check-git-tree.sh
+          if [ -d /tmp/_test_backup ]; then
+            mv /tmp/_test_backup test
+          fi
