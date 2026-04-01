@@ -85,6 +85,7 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::939345161466:role/github-oidc-setup-david-Role-8DcbDlLGfv4O
           role-session-name: ${{ github.run_id }}
+          role-duration-seconds: 7200
           aws-region: us-east-1
 
       - name: Launch EC2 instance
