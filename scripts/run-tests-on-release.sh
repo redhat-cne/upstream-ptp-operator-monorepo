@@ -1,0 +1,180 @@
+#!/bin/bash
+# Run main branch CI tests against a release branch.
+#
+# This script:
+#   1. Clones the release branch into ptp-operator-<branch>/
+#   2. Fetches main branch scripts, tests, hack, ptp-tools, api, pkg into base-repo/
+#   3. Patches the release code with main's test infrastructure
+#   4. Either runs locally (on VM) or sends to a remote VM via SSH
+#
+# Usage:
+#   Remote (from host to VM):
+#     ./run-tests-on-release.sh <VM_IP> <RELEASE_BRANCH> [REPO_URL]
+#
+#   Local (on the VM itself):
+#     ./run-tests-on-release.sh --local <VM_IP> <RELEASE_BRANCH> [REPO_URL]
+#
+# Examples:
+#   # Remote: send to VM and run
+#   ./run-tests-on-release.sh 10.70.0.128 one-repo.4.12
+#   ./run-tests-on-release.sh 10.70.0.128 release-4.14 https://github.com/openshift/ptp-operator.git
+#
+#   # Local: run directly on the VM
+#   ./run-tests-on-release.sh --local 10.70.0.128 one-repo.4.12
+#   ./run-tests-on-release.sh --local 10.70.0.128 one-repo.4.12 git@github.com:edcdavid-org/ptp-operator-test.git
+#
+set -euo pipefail
+
+# -----------------------------------------------
+# Parse arguments
+# -----------------------------------------------
+LOCAL_MODE=false
+if [ "${1:-}" = "--local" ]; then
+  LOCAL_MODE=true
+  shift
+fi
+
+VM_IP="${1:?Usage: $0 [--local] <VM_IP> <RELEASE_BRANCH> [REPO_URL]}"
+RELEASE_BRANCH="${2:?Usage: $0 [--local] <VM_IP> <RELEASE_BRANCH> [REPO_URL]}"
+REPO_URL="${3:-git@github.com:edcdavid-org/ptp-operator-test.git}"
+MAIN_BRANCH="${MAIN_BRANCH:-main}"
+SSH_KEY="${SSH_KEY:-~/.ssh/id_rsa}"
+SSH_USER="${SSH_USER:-fedora}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $SSH_KEY"
+
+# Sanitize branch name for directory suffix (replace / with -)
+BRANCH_SUFFIX=$(echo "$RELEASE_BRANCH" | tr '/' '-')
+PROJECT_DIR="ptp-operator-${BRANCH_SUFFIX}"
+
+if [ "$LOCAL_MODE" = true ]; then
+  WORKDIR="$HOME"
+else
+  WORKDIR=$(mktemp -d)
+  trap "echo 'Workdir preserved at: $WORKDIR'" EXIT
+fi
+
+echo "============================================"
+echo "  PTP Operator Release Test Runner"
+echo "============================================"
+echo "  Mode:     $([ "$LOCAL_MODE" = true ] && echo "local (on VM)" || echo "remote (SSH to VM)")"
+echo "  VM:       $VM_IP"
+echo "  Branch:   $RELEASE_BRANCH"
+echo "  Repo:     $REPO_URL"
+echo "  Main:     $MAIN_BRANCH"
+echo "  Dir:      $PROJECT_DIR"
+echo "  Workdir:  $WORKDIR"
+echo "============================================"
+
+cd "$WORKDIR"
+
+# -----------------------------------------------
+# Step 1: Clone the release branch
+# -----------------------------------------------
+echo ""
+echo ">>> Step 1: Cloning release branch '$RELEASE_BRANCH' into $PROJECT_DIR..."
+rm -rf "$PROJECT_DIR"
+git clone --branch "$RELEASE_BRANCH" --single-branch --depth 1 "$REPO_URL" "$PROJECT_DIR"
+
+# -----------------------------------------------
+# Step 2: Fetch main branch (sparse checkout)
+# -----------------------------------------------
+echo ""
+echo ">>> Step 2: Fetching main branch (scripts, tests, hack, ptp-tools, api, pkg)..."
+rm -rf base-repo
+git clone --branch "$MAIN_BRANCH" --single-branch --depth 1 --no-checkout "$REPO_URL" base-repo
+cd base-repo
+git sparse-checkout init --cone
+git sparse-checkout set ptp-tools scripts hack test api pkg
+git checkout
+cd ..
+
+# -----------------------------------------------
+# Step 3: Copy main's infrastructure to release
+# -----------------------------------------------
+echo ""
+echo ">>> Step 3: Patching release with main's test infrastructure..."
+
+# Copy scripts (don't overwrite existing)
+mkdir -p "$PROJECT_DIR/scripts"
+cp -rf base-repo/scripts/* "$PROJECT_DIR/scripts/"
+
+# Copy ptp-tools from upstream (has monorepo Dockerfile fixes)
+rm -rf "$PROJECT_DIR/ptp-tools"
+cp -r base-repo/ptp-tools "$PROJECT_DIR/ptp-tools"
+
+# Copy hack directory (contains build.sh with Go modules fixes)
+mkdir -p "$PROJECT_DIR/hack"
+cp -f base-repo/hack/* "$PROJECT_DIR/hack/" 2>/dev/null || true
+
+# Copy test directory from main (has its own go.mod)
+echo "  Copying tests from main..."
+rm -rf "$PROJECT_DIR/test"
+cp -r base-repo/test "$PROJECT_DIR/test"
+
+# test/go.mod defaults to replace => .. (monorepo root); rewrite to ../../base-repo for CI layout
+perl -i -pe 's|=> \.\.$|=> ../../base-repo|' "$PROJECT_DIR/test/go.mod"
+
+# -----------------------------------------------
+# Step 4: Fix module paths if needed
+# -----------------------------------------------
+echo ""
+echo ">>> Step 4: Adjusting module paths..."
+
+TARGET_MODULE=$(grep "^module " "$PROJECT_DIR/go.mod" | awk '{print $2}')
+SOURCE_MODULE="github.com/k8snetworkplumbingwg/ptp-operator"
+
+echo "  Source module: $SOURCE_MODULE"
+echo "  Target module: $TARGET_MODULE"
+
+if [ "$TARGET_MODULE" != "$SOURCE_MODULE" ]; then
+  echo "  Replacing module paths..."
+
+  # Use perl for portable in-place substitution (works on both macOS and Linux)
+  # Update ALL occurrences in test/go.mod
+  perl -i -pe "s|\Q$SOURCE_MODULE\E|$TARGET_MODULE|g" "$PROJECT_DIR/test/go.mod"
+
+  # Delete go.sum - will be regenerated by go mod tidy
+  rm -f "$PROJECT_DIR/test/go.sum"
+
+  # Update imports in Go test files
+  find "$PROJECT_DIR/test" -name "*.go" -exec perl -i -pe "s|\Q$SOURCE_MODULE\E|$TARGET_MODULE|g" {} \;
+
+  # Update api/ and pkg/ imports in base-repo
+  find base-repo/api base-repo/pkg -name "*.go" -exec perl -i -pe "s|\Q$SOURCE_MODULE\E|$TARGET_MODULE|g" {} \; 2>/dev/null || true
+else
+  echo "  Module paths match, no changes needed."
+fi
+
+# -----------------------------------------------
+# Step 5: Run tests
+# -----------------------------------------------
+if [ "$LOCAL_MODE" = true ]; then
+  # Running directly on the VM
+  echo ""
+  echo ">>> Step 5: Running tests locally..."
+  echo "============================================"
+
+  sudo "./$PROJECT_DIR/scripts/run-on-vm.sh" "$VM_IP"
+else
+  # Send to remote VM and run
+  echo ""
+  echo ">>> Step 5: Sending code to VM ($SSH_USER@$VM_IP)..."
+
+  rsync -r -e "ssh $SSH_OPTS" "$PROJECT_DIR" base-repo "$SSH_USER@$VM_IP":~/.
+
+  echo ""
+  echo ">>> Step 6: Running tests on VM..."
+  echo "============================================"
+
+  ssh $SSH_OPTS \
+      -o ServerAliveInterval=60 \
+      -o ServerAliveCountMax=10 \
+      -o ConnectTimeout=30 \
+      -o TCPKeepAlive=yes \
+      "$SSH_USER@$VM_IP" \
+      "set +e; \
+      sudo ./$PROJECT_DIR/scripts/run-on-vm.sh '$VM_IP'; \
+      exit_code=\$?; \
+      echo '=== Script completed with exit code:' \$exit_code '==='; \
+      exit \$exit_code"
+fi

@@ -1,0 +1,6 @@
+name: "ptp-operator: Validate"
+on: [push, pull_request]
+
+jobs:
+  validate:
+    uses: ./.github/workflows/_reusable-ptp-operator-validate.yml

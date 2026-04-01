@@ -1,0 +1,11 @@
+name: "linuxptp-daemon: PR CI Triggers"
+on:
+  pull_request_target:
+    types: [opened, reopened]
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+
+jobs:
+  triggers:
+    uses: ./.github/workflows/_reusable-linuxptp-daemon-pr-ci-triggers.yml
+    secrets: inherit

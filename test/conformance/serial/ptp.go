@@ -369,7 +369,10 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				ptphelper.RestartPTPDaemon()
 			}
 
-			portEngine.Initialize(fullConfig.DiscoveredClockUnderTestPod, fullConfig.DiscoveredFollowerInterfaces)
+			// PortEngine uses openshift_ptp_interface_role metric, only available in 4.15+
+			if ptphelper.IsPTPOperatorVersionAtLeast("4.15") {
+				portEngine.Initialize(fullConfig.DiscoveredClockUnderTestPod, fullConfig.DiscoveredFollowerInterfaces)
+			}
 
 		})
 
@@ -498,6 +501,12 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				if fullConfig.Status == testconfig.DiscoveryFailureStatus {
 					Skip("Failed to find a valid ptp slave configuration")
 				}
+				// Ensure ptpPods is populated (may be nil if interface discovery tests were skipped)
+				if ptpPods == nil {
+					ptpPods, err = client.Client.CoreV1().Pods(pkg.PtpLinuxDaemonNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: "app=linuxptp-daemon"})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(len(ptpPods.Items)).To(BeNumerically(">", 0), "linuxptp-daemon is not deployed on cluster")
+				}
 			})
 			AfterEach(func() {
 				portEngine.TurnAllPortsUp()
@@ -515,28 +524,27 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				}
 
 				for podIndex := range ptpPods.Items {
-					isClockUnderTest, err := ptphelper.IsClockUnderTestPod(&ptpPods.Items[podIndex])
+					pod := &ptpPods.Items[podIndex]
+					isClockUnderTest, err := ptphelper.IsClockUnderTestPod(pod)
 					if err != nil {
 						Fail(fmt.Sprintf("check clock under test clock type, err=%s", err))
 					}
-					isGrandmaster, err := ptphelper.IsGrandMasterPod(&ptpPods.Items[podIndex])
+					isGrandmaster, err := ptphelper.IsGrandMasterPod(pod)
 					if err != nil {
 						Fail(fmt.Sprintf("check Grandmaster clock type, err=%s", err))
 					}
+
+					nodeName := pod.Spec.NodeName
 					if isClockUnderTest {
-						_, err = pods.GetPodLogsRegex(ptpPods.Items[podIndex].Namespace,
-							ptpPods.Items[podIndex].Name, pkg.PtpContainerName,
-							profileSlave, true, pkg.TimeoutIn3Minutes)
-						if err != nil {
-							Fail(fmt.Sprintf("could not get slave profile name, err=%s", err))
-						}
+						Eventually(func() error {
+							return checkProfileInPodLogs(nodeName, pkg.PtpLinuxDaemonNamespace, profileSlave)
+						}, pkg.TimeoutIn5Minutes, 30*time.Second).Should(BeNil(),
+							fmt.Sprintf("could not get slave profile name on node %s", nodeName))
 					} else if isGrandmaster && fullConfig.DiscoveredGrandMasterPtpConfig != nil {
-						_, err = pods.GetPodLogsRegex(ptpPods.Items[podIndex].Namespace,
-							ptpPods.Items[podIndex].Name, pkg.PtpContainerName,
-							profileMaster, true, pkg.TimeoutIn5Minutes)
-						if err != nil {
-							Fail(fmt.Sprintf("could not get master profile name, err=%s", err))
-						}
+						Eventually(func() error {
+							return checkProfileInPodLogs(nodeName, pkg.PtpLinuxDaemonNamespace, profileMaster)
+						}, pkg.TimeoutIn5Minutes, 30*time.Second).Should(BeNil(),
+							fmt.Sprintf("could not get master profile name on node %s", nodeName))
 					}
 				}
 			})
@@ -3386,6 +3394,27 @@ func killTs2phcInBackground(stopChan chan struct{}, fullConfig testconfig.TestCo
 			time.Sleep(2 * time.Millisecond) // Keep hammering every 2 ms
 		}
 	}
+}
+
+// checkProfileInPodLogs searches for a profile name string in the logs of a PTP daemon pod on a given node.
+// It re-fetches the current pod by node name to handle pod restarts (e.g., DaemonSet rolling updates).
+// Returns nil if found, or an error if the regex is not found within a 1-minute streaming window.
+func checkProfileInPodLogs(nodeName, namespace, profileRegex string) error {
+	podList, err := client.Client.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=linuxptp-daemon",
+		FieldSelector: "spec.nodeName=" + nodeName,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods on node %s: %v", nodeName, err)
+	}
+	if len(podList.Items) == 0 {
+		return fmt.Errorf("no linuxptp-daemon pod found on node %s", nodeName)
+	}
+	pod := &podList.Items[0]
+	_, err = pods.GetPodLogsRegex(pod.Namespace,
+		pod.Name, pkg.PtpContainerName,
+		profileRegex, true, pkg.TimeoutIn1Minute)
+	return err
 }
 
 func waitForClockClass(fullConfig testconfig.TestConfig, expectedState string) {

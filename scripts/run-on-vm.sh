@@ -9,6 +9,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 echo "Now in: $(pwd)"
 
+# Ensure Go modules mode is always used
+export GO111MODULE=on
 export GOMAXPROCS=$(nproc)
 
 source ./install-tools.sh
@@ -71,10 +73,27 @@ kubectl delete pods -l name=ptp-operator -n openshift-ptp
 # wait for operator to come up
 kubectl rollout status deployment ptp-operator -n openshift-ptp
 
-# Patch ptpoperatorconfig to start events (in case it is not configured yet )
-./retry.sh 60 5 kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"ptpEventConfig": {"enableEventPublisher": true, "transportHost": "http://ptp-event-publisher-service-NODE_NAME.openshift-ptp.svc.cluster.local:9043", "storageType": "local-sc"}, "daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}'
+# Patch ptpoperatorconfig - use emptyDir for storage (local-path PVCs can't be shared across DaemonSet nodes)
+if ! kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"ptpEventConfig": {"enableEventPublisher": true, "transportHost": "http://ptp-event-publisher-service-NODE_NAME.openshift-ptp.svc.cluster.local:9043", "storageType": "emptyDir"}, "daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}' 2>/dev/null; then
+    echo "Events config failed (may not be supported in this release), trying basic config..."
+    if ! kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"ptpEventConfig": {"enableEventPublisher": true, "transportHost": "http://ptp-event-publisher-service-NODE_NAME.openshift-ptp.svc.cluster.local:9043"}, "daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}' 2>/dev/null; then
+        echo "Events config not supported, using basic daemonNodeSelector only..."
+        kubectl patch ptpoperatorconfig default -nopenshift-ptp --type=merge --patch '{"spec": {"daemonNodeSelector": {"node-role.kubernetes.io/worker": ""}}}'
+    fi
+fi
 
 ./retry.sh 30 3 kubectl rollout status ds linuxptp-daemon -n openshift-ptp
+
+# Tests from main expect v2 event API for operator >= 4.18.
+# Branches that default to v1 but support v2 need explicit configuration.
+if grep -q 'DefaultApiVersion.*"1.0"' ../controllers/ptpoperatorconfig_controller.go 2>/dev/null; then
+  if grep -q 'ApiVersion.*apiVersion' ../api/v1/ptpoperatorconfig_types.go 2>/dev/null; then
+    echo "Operator defaults to v1 event API, switching to v2 for test compatibility"
+    ./retry.sh 60 5 kubectl patch ptpoperatorconfig default -n openshift-ptp \
+      --type=merge --patch '{"spec": {"ptpEventConfig": {"apiVersion": "2.0"}}}'
+    ./retry.sh 30 3 kubectl rollout status ds linuxptp-daemon -n openshift-ptp
+  fi
+fi
 
 # Fix prometheus monitoring
 ./fix-ptp-prometheus-monitoring.sh
