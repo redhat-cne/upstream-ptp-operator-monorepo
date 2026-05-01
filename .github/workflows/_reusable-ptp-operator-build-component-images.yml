@@ -1,0 +1,262 @@
+name: "Reusable: ptp-operator Build All Images and Catalog to GHCR"
+
+on:
+  workflow_call:
+
+env:
+  REGISTRY: ghcr.io
+  ORG: redhat-cne
+  OPERATOR_IMAGE: ghcr.io/redhat-cne/ptp-operator
+  LINUXPTP_IMAGE: ghcr.io/redhat-cne/ptp
+  CLOUD_EVENT_PROXY_IMAGE: ghcr.io/redhat-cne/cloud-event-proxy
+  KUBE_RBAC_PROXY_IMAGE: ghcr.io/redhat-cne/kube-rbac-proxy
+  MUST_GATHER_IMAGE: ghcr.io/redhat-cne/ptp-must-gather
+  BUNDLE_IMAGE: ghcr.io/redhat-cne/ptp-operator-bundle
+  CATALOG_IMAGE: ghcr.io/redhat-cne/ptp-operator-catalog
+
+jobs:
+  build-images:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - release-4.12
+          - release-4.13
+          - release-4.14
+          - release-4.15
+          - release-4.16
+          - release-4.17
+          - release-4.18
+          - release-4.19
+          - release-4.20
+          - release-4.21
+          - release-4.22
+          - release-4.23
+          - release-5.0
+          - main
+    steps:
+      - name: Checkout ${{ matrix.branch }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+
+      - name: Extract VERSION from Makefile
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^VERSION ?=' Makefile | awk '{print $3}')
+          BUNDLE_VERSION="${VERSION}.0"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "bundle_version=${BUNDLE_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Detect ptp-tools availability
+        id: detect
+        run: |
+          if [ -d ptp-tools ] && [ -f ptp-tools/Dockerfile.ptpop ]; then
+            echo "has_ptp_tools=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ptp_tools=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ptp-operator image (ptp-tools)
+        if: steps.detect.outputs.has_ptp_tools == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ptp-tools/Dockerfile.ptpop
+          push: true
+          tags: ${{ env.OPERATOR_IMAGE }}:v${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=ptpop-${{ matrix.branch }}
+          cache-to: type=gha,mode=max,scope=ptpop-${{ matrix.branch }}
+
+      - name: Build and push ptp-operator image (fallback)
+        if: steps.detect.outputs.has_ptp_tools != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.OPERATOR_IMAGE }}:v${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=ptpop-${{ matrix.branch }}
+          cache-to: type=gha,mode=max,scope=ptpop-${{ matrix.branch }}
+
+      - name: Build and push linuxptp-daemon image
+        if: steps.detect.outputs.has_ptp_tools == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ptp-tools/Dockerfile.lptpd
+          push: true
+          tags: ${{ env.LINUXPTP_IMAGE }}:v${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=lptpd-${{ matrix.branch }}
+          cache-to: type=gha,mode=max,scope=lptpd-${{ matrix.branch }}
+
+      - name: Build and push cloud-event-proxy image
+        if: steps.detect.outputs.has_ptp_tools == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ptp-tools/Dockerfile.cep
+          push: true
+          tags: ${{ env.CLOUD_EVENT_PROXY_IMAGE }}:v${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=cep-${{ matrix.branch }}
+          cache-to: type=gha,mode=max,scope=cep-${{ matrix.branch }}
+
+      - name: Build and push kube-rbac-proxy image
+        if: steps.detect.outputs.has_ptp_tools == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ptp-tools/Dockerfile.krp
+          push: true
+          tags: ${{ env.KUBE_RBAC_PROXY_IMAGE }}:v${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=krp-${{ matrix.branch }}
+          cache-to: type=gha,mode=max,scope=krp-${{ matrix.branch }}
+
+      - name: Build and push must-gather image
+        if: steps.detect.outputs.has_ptp_tools == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ptp-tools/Dockerfile.ptpmg
+          push: true
+          tags: ${{ env.MUST_GATHER_IMAGE }}:v${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=ptpmg-${{ matrix.branch }}
+          cache-to: type=gha,mode=max,scope=ptpmg-${{ matrix.branch }}
+
+      - name: Build and push bundle image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: bundle.Dockerfile
+          push: true
+          tags: ${{ env.BUNDLE_IMAGE }}:v${{ steps.version.outputs.bundle_version }}
+          cache-from: type=gha,scope=bundle-${{ matrix.branch }}
+          cache-to: type=gha,mode=max,scope=bundle-${{ matrix.branch }}
+
+      - name: Write version artifact
+        run: echo "${{ steps.version.outputs.bundle_version }}" > bundle-version.txt
+
+      - name: Upload version artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-version-${{ matrix.branch }}
+          path: bundle-version.txt
+
+  build-catalog:
+    runs-on: ubuntu-latest
+    needs: build-images
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Download all version artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-version-*
+          merge-multiple: false
+          path: version-artifacts
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install opm
+        run: |
+          OPM_VERSION="v1.60.0"
+          curl -sSLo opm "https://github.com/operator-framework/operator-registry/releases/download/${OPM_VERSION}/linux-amd64-opm"
+          chmod +x opm
+          sudo mv opm /usr/local/bin/opm
+
+      - name: Build FBC catalog directory
+        env:
+          BUNDLE_IMAGE: ${{ env.BUNDLE_IMAGE }}
+        run: |
+          set -euo pipefail
+          mkdir -p catalog
+
+          BUNDLE_VERSIONS=()
+          for f in version-artifacts/bundle-version-*/bundle-version.txt; do
+            ver=$(cat "$f")
+            BUNDLE_VERSIONS+=("$ver")
+          done
+
+          IFS=$'\n' SORTED=($(sort -V <<<"${BUNDLE_VERSIONS[*]}")); unset IFS
+          echo "Bundle versions to include: ${SORTED[*]}"
+
+          opm init ptp-operator \
+            --default-channel=stable \
+            --description=README.md \
+            --output=yaml > catalog/index.yaml
+
+          for ver in "${SORTED[@]}"; do
+            echo "Rendering bundle ${BUNDLE_IMAGE}:v${ver} ..."
+            opm render "${BUNDLE_IMAGE}:v${ver}" --output=yaml >> catalog/index.yaml
+          done
+
+          {
+            echo "---"
+            echo "schema: olm.channel"
+            echo "package: ptp-operator"
+            echo "name: stable"
+            echo "entries:"
+            for ver in "${SORTED[@]}"; do
+              echo "  - name: ptp-operator.v${ver}"
+              echo "    skipRange: \">=4.3.0-0 <${ver}\""
+            done
+          } >> catalog/index.yaml
+
+          echo "--- Catalog index.yaml ---"
+          cat catalog/index.yaml
+          echo "--- Validating ---"
+          opm validate catalog/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push catalog image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: catalog-publish.Dockerfile
+          push: true
+          tags: |
+            ${{ env.CATALOG_IMAGE }}:latest
+            ${{ env.CATALOG_IMAGE }}:v${{ github.run_number }}
+
+  make-public:
+    runs-on: ubuntu-latest
+    needs: build-catalog
+    permissions:
+      packages: write
+    steps:
+      - name: Set packages to public visibility
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for pkg in ptp-operator ptp cloud-event-proxy kube-rbac-proxy ptp-must-gather ptp-operator-bundle ptp-operator-catalog; do
+            echo "Setting ${pkg} to public..."
+            gh api --method PATCH \
+              "/orgs/${{ env.ORG }}/packages/container/${pkg}" \
+              -f visibility=public \
+              || echo "Warning: could not set ${pkg} to public (may require admin PAT)"
+          done
