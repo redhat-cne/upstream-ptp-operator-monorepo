@@ -1,0 +1,21 @@
+name: "linuxptp-daemon: CodeQL Advanced"
+on:
+  push:
+    branches: ["main", "one-repo*", "release-*"]
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+  pull_request:
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+  schedule:
+    - cron: '20 21 * * 4'
+
+permissions:
+  security-events: write
+  packages: read
+  actions: read
+  contents: read
+
+jobs:
+  analyze:
+    uses: ./.github/workflows/_reusable-linuxptp-daemon-codeql.yml

@@ -1,0 +1,15 @@
+name: "ptp-operator: Deploy Operator Images to GHCR"
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  build-operator:
+    uses: ./.github/workflows/_reusable-ptp-operator-build-operator-image.yml
+    secrets: inherit

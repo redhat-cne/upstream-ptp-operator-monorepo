@@ -56,7 +56,17 @@ JUNIT_OUTPUT_DIR="${JUNIT_OUTPUT_DIR:-/tmp/artifacts}"
 JUNIT_OUTPUT_FILE="${JUNIT_OUTPUT_FILE:-unit_report.xml}"
 SUITE=../test/conformance
 export KUBECONFIG=${KUBECONFIG:-~/.kube/config}
-go install github.com/onsi/ginkgo/v2/ginkgo
+
+# Install ginkgo (use -mod=mod since vendor directory exists)
+GOFLAGS=-mod=mod go install github.com/onsi/ginkgo/v2/ginkgo
+
+# Sync dependencies for test module (tests have their own go.mod)
+cd ../test
+go mod tidy
+cd -
+
+# Use mod mode for tests - test module has its own go.mod
+export GOFLAGS=-mod=mod
 
 mkdir -p "$JUNIT_OUTPUT_DIR"
 
@@ -75,7 +85,8 @@ EOF
 export USE_CONTAINER_CMDS=
 export PTP_TEST_CONFIG_FILE="$(pwd)/config.yaml"
 export PTP_LOG_LEVEL
-export GOFLAGS=-mod=vendor
+# Use mod mode for tests - test module has its own go.mod
+export GOFLAGS=-mod=mod
 export KEEP_PTPCONFIG="${KEEP_PTPCONFIG:-true}"
 
 export SKIP_INTERFACES="${SKIP_INTERFACES:-eth0}"

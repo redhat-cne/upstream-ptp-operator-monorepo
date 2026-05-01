@@ -1,0 +1,37 @@
+name: "Build All Images and Catalog"
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: 'JSON array of branches to build (leave empty for all)'
+        required: false
+        type: string
+      repository:
+        description: 'Repository to build from (leave empty for downstream default)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-upstream:
+    uses: ./.github/workflows/_reusable-build-all-images.yml
+    with:
+      branches: '["main"]'
+    secrets: inherit
+
+  build-downstream:
+    uses: ./.github/workflows/_reusable-build-all-images.yml
+    with:
+      branches: ${{ inputs.branches || '["release-4.12","release-4.13","release-4.14","release-4.15","release-4.16","release-4.17","release-4.18","release-4.19","release-4.20","release-4.21","release-4.22","release-4.23","release-5.0","main"]' }}
+      repository: ${{ inputs.repository || 'redhat-cne/downstream-ptp-operator-monorepo' }}
+    secrets: inherit

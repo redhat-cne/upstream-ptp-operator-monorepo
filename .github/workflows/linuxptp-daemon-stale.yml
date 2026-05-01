@@ -1,0 +1,8 @@
+name: "linuxptp-daemon: Close stale issues and PRs"
+on:
+  schedule:
+    - cron: '30 1 * * *'
+
+jobs:
+  stale:
+    uses: ./.github/workflows/_reusable-linuxptp-daemon-stale.yml
