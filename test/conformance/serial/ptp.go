@@ -356,7 +356,11 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 
 	Describe("PTP e2e tests", func() {
 		var ptpPods *v1core.PodList
-		var fifoPriorities map[string]int64
+		var fifoPriorities []struct {
+			configName  string
+			profileName string
+			priority    int64
+		}
 		var fullConfig testconfig.TestConfig
 		portEngine := ptptesthelper.PortEngine{}
 
@@ -528,10 +532,21 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				if fullConfig.PtpModeDesired == testconfig.Discovery {
 					Skip("This test needs the ptp-daemon to be rebooted but it is not possible in discovery mode, skipping")
 				}
-				profileSlave := fmt.Sprintf("Profile Name: %s", fullConfig.DiscoveredClockUnderTestPtpConfig.Name)
+				clockUnderTestConfig := (*ptpv1.PtpConfig)(fullConfig.DiscoveredClockUnderTestPtpConfig)
+				profileSlaveName, err := ptphelper.GetProfileName(clockUnderTestConfig, true)
+				Expect(err).NotTo(HaveOccurred(), "could not get clock-under-test profile name")
+				profileSlave := "Profile Name: " + ptphelper.ProfileNameMatchPattern(clockUnderTestConfig.Name, profileSlaveName)
+				if fullConfig.PtpModeDesired == testconfig.TelcoBoundaryClock {
+					profileSlave = "Profile Name: (?:" +
+						ptphelper.ProfileNameMatchPattern(clockUnderTestConfig.Name, "tbc-tr") + "|" +
+						ptphelper.ProfileNameMatchPattern(clockUnderTestConfig.Name, "tbc-tt") + ")"
+				}
 				profileMaster := ""
 				if fullConfig.DiscoveredGrandMasterPtpConfig != nil {
-					profileMaster = fmt.Sprintf("Profile Name: %s", fullConfig.DiscoveredGrandMasterPtpConfig.Name)
+					gmConfig := (*ptpv1.PtpConfig)(fullConfig.DiscoveredGrandMasterPtpConfig)
+					gmProfileName, gmErr := ptphelper.GetProfileName(gmConfig, false)
+					Expect(gmErr).NotTo(HaveOccurred(), "could not get grandmaster profile name")
+					profileMaster = "Profile Name: " + ptphelper.ProfileNameMatchPattern(gmConfig.Name, gmProfileName)
 				}
 
 				for podIndex := range ptpPods.Items {
@@ -544,24 +559,16 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 						Fail(fmt.Sprintf("check Grandmaster clock type, err=%s", err))
 					}
 					if isClockUnderTest {
-						if fullConfig.PtpModeDesired == testconfig.TelcoBoundaryClock {
-							// T-BC daemon profiles are qualified: <configname>_tbc-tr / <configname>_tbc-tt
-							tbcConfigName := fullConfig.DiscoveredClockUnderTestPtpConfig.Name
-							_, err = pods.GetPodLogsRegex(ptpPods.Items[podIndex].Namespace,
-								ptpPods.Items[podIndex].Name, pkg.PtpContainerName,
-								"Profile Name: "+regexp.QuoteMeta(tbcConfigName)+"_tbc-t(r|t)", false, pkg.TimeoutIn3Minutes)
-						} else {
-							_, err = pods.GetPodLogsRegex(ptpPods.Items[podIndex].Namespace,
-								ptpPods.Items[podIndex].Name, pkg.PtpContainerName,
-								profileSlave, true, pkg.TimeoutIn3Minutes)
-						}
+						_, err = pods.GetPodLogsRegex(ptpPods.Items[podIndex].Namespace,
+							ptpPods.Items[podIndex].Name, pkg.PtpContainerName,
+							profileSlave, false, pkg.TimeoutIn3Minutes)
 						if err != nil {
 							Fail(fmt.Sprintf("could not get slave profile name, err=%s", err))
 						}
 					} else if isGrandmaster && fullConfig.DiscoveredGrandMasterPtpConfig != nil {
 						_, err = pods.GetPodLogsRegex(ptpPods.Items[podIndex].Namespace,
 							ptpPods.Items[podIndex].Name, pkg.PtpContainerName,
-							profileMaster, true, pkg.TimeoutIn5Minutes)
+							profileMaster, false, pkg.TimeoutIn5Minutes)
 						if err != nil {
 							Fail(fmt.Sprintf("could not get master profile name, err=%s", err))
 						}
@@ -586,9 +593,11 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				if fullConfig.L2Config != nil && !isExternalMaster {
 					aLabel := pkg.PtpGrandmasterNodeLabel
 					var aString string
+					Expect(fullConfig.DiscoveredGrandMasterPtpConfig).NotTo(BeNil(), "expected discovered grandmaster config")
+					gmConfigName := (*ptpv1.PtpConfig)(fullConfig.DiscoveredGrandMasterPtpConfig).Name
 					Eventually(func() error {
 						var getErr error
-						aString, getErr = ptphelper.GetClockIDMaster(pkg.PtpGrandMasterPolicyName, &aLabel, nil, true)
+						aString, getErr = ptphelper.GetClockIDMaster(gmConfigName, pkg.PtpGrandMasterPolicyName, &aLabel, nil, true)
 						return getErr
 					}, pkg.TimeoutIn3Minutes, pkg.Timeout10Seconds).Should(BeNil(),
 						"Timeout to get grandmaster clock ID")
@@ -774,9 +783,11 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				if fullConfig.L2Config != nil && !isExternalMaster {
 					aLabel := pkg.PtpGrandmasterNodeLabel
 					var aString string
+					Expect(fullConfig.DiscoveredGrandMasterPtpConfig).NotTo(BeNil(), "expected discovered grandmaster config")
+					gmConfigName := (*ptpv1.PtpConfig)(fullConfig.DiscoveredGrandMasterPtpConfig).Name
 					Eventually(func() error {
 						var getErr error
-						aString, getErr = ptphelper.GetClockIDMaster(pkg.PtpGrandMasterPolicyName, &aLabel, nil, true)
+						aString, getErr = ptphelper.GetClockIDMaster(gmConfigName, pkg.PtpGrandMasterPolicyName, &aLabel, nil, true)
 						return getErr
 					}, pkg.TimeoutIn3Minutes, pkg.Timeout10Seconds).Should(BeNil(),
 						"Timeout to get grandmaster clock ID")
@@ -890,15 +901,15 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				}
 				aLabel := pkg.PtpClockUnderTestNodeLabel
 				name := pkg.PtpBcMaster1PolicyName
+				Expect(fullConfig.DiscoveredClockUnderTestPtpConfig).ToNot(BeNil(), "BC mode requires DiscoveredClockUnderTestPtpConfig")
+				bc1ConfigName := (*ptpv1.PtpConfig)(fullConfig.DiscoveredClockUnderTestPtpConfig).Name
 				if fullConfig.PtpModeDiscovered == testconfig.TelcoBoundaryClock {
-					Expect(fullConfig.DiscoveredClockUnderTestPtpConfig).ToNot(BeNil(), "T-BC mode requires DiscoveredClockUnderTestPtpConfig")
-					crName := (*ptpv1.PtpConfig)(fullConfig.DiscoveredClockUnderTestPtpConfig).Name
-					name = ptphelper.QualifyProfileName(crName, "tbc-tr")
+					name = "tbc-tr"
 				}
 				var masterIDBc1 string
 				Eventually(func() error {
 					var getErr error
-					masterIDBc1, getErr = ptphelper.GetClockIDMaster(name, &aLabel, nil, false)
+					masterIDBc1, getErr = ptphelper.GetClockIDMaster(bc1ConfigName, name, &aLabel, nil, false)
 					return getErr
 				}, pkg.TimeoutIn3Minutes, pkg.Timeout10Seconds).Should(BeNil(),
 					"Timeout to get BC master1 clock ID")
@@ -909,9 +920,13 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 					(fullConfig.FoundSolutions[testconfig.AlgoDualNicBCWithSlavesExtGMString] || fullConfig.FoundSolutions[testconfig.AlgoDualNicBCWithSlavesString]) {
 					aLabel := pkg.PtpClockUnderTestNodeLabel
 					var masterIDBc2 string
+					bc2ConfigName := bc1ConfigName
+					if fullConfig.DiscoveredClockUnderTestSecondaryPtpConfig != nil {
+						bc2ConfigName = (*ptpv1.PtpConfig)(fullConfig.DiscoveredClockUnderTestSecondaryPtpConfig).Name
+					}
 					Eventually(func() error {
 						var getErr error
-						masterIDBc2, getErr = ptphelper.GetClockIDMaster(pkg.PtpBcMaster2PolicyName, &aLabel, nil, false)
+						masterIDBc2, getErr = ptphelper.GetClockIDMaster(bc2ConfigName, pkg.PtpBcMaster2PolicyName, &aLabel, nil, false)
 						return getErr
 					}, pkg.TimeoutIn3Minutes, pkg.Timeout10Seconds).Should(BeNil(),
 						"Timeout to get BC master2 clock ID")
@@ -984,7 +999,7 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				By("Waiting for daemon to load the temp profile", func() {
 					_, err := pods.GetPodLogsRegex(testPtpPod.Namespace,
 						testPtpPod.Name, pkg.PtpContainerName,
-						"Profile Name: "+pkg.PtpTempPolicyName, true, pkg.TimeoutIn3Minutes)
+						"Profile Name: "+ptphelper.ProfileNameMatchPattern(pkg.PtpTempPolicyName, pkg.PtpTempPolicyName), false, pkg.TimeoutIn3Minutes)
 					Expect(err).NotTo(HaveOccurred(), "daemon did not load temp profile in time")
 				})
 
@@ -1000,9 +1015,11 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 					if fullConfig.L2Config != nil && !isExternalMaster {
 						aLabel := pkg.PtpGrandmasterNodeLabel
 						var gmClockID string
+						Expect(fullConfig.DiscoveredGrandMasterPtpConfig).NotTo(BeNil(), "expected discovered grandmaster config")
+						gmConfigName := (*ptpv1.PtpConfig)(fullConfig.DiscoveredGrandMasterPtpConfig).Name
 						Eventually(func() error {
 							var getErr error
-							gmClockID, getErr = ptphelper.GetClockIDMaster(pkg.PtpGrandMasterPolicyName, &aLabel, nil, true)
+							gmClockID, getErr = ptphelper.GetClockIDMaster(gmConfigName, pkg.PtpGrandMasterPolicyName, &aLabel, nil, true)
 							return getErr
 						}, pkg.TimeoutIn3Minutes, pkg.Timeout10Seconds).Should(BeNil(),
 							"Timeout to get grandmaster clock ID")
@@ -1021,7 +1038,7 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 							var slaveMaster string
 							Eventually(func() error {
 								var getErr error
-								slaveMaster, getErr = ptphelper.GetClockIDForeign(profileName, label, node)
+								slaveMaster, getErr = ptphelper.GetClockIDForeign(modifiedPtpConfig.Name, profileName, label, node)
 								if getErr != nil {
 									return getErr
 								}
@@ -1045,17 +1062,22 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				})
 
 				By("Checking the profile is reverted", func() {
+					profileLogPattern := "Profile Name: " + ptphelper.ProfileNameMatchPattern(policyName, policyName)
+					profileFilePattern := ptphelper.ProfileNameMatchPattern(policyName, policyName)
+					if policyName == pkg.PTPWPCTBCPolicyName {
+						tbcPattern := "(?:" +
+							ptphelper.ProfileNameMatchPattern(policyName, "tbc-tr") + "|" +
+							ptphelper.ProfileNameMatchPattern(policyName, "tbc-tt") + ")"
+						profileLogPattern = "Profile Name: " + tbcPattern
+						profileFilePattern = tbcPattern
+					}
 					_, err := pods.GetPodLogsRegex(testPtpPod.Namespace,
 						testPtpPod.Name, pkg.PtpContainerName,
-						"Profile Name: "+policyName, true, pkg.TimeoutIn3Minutes)
+						profileLogPattern, false, pkg.TimeoutIn3Minutes)
 					if err != nil {
-						profileRegex := policyName
-						if policyName == pkg.PTPWPCTBCPolicyName {
-							profileRegex = "tbc-(tr|tt)"
-						}
 						// Fallback to file-based search to get the profile name
 						// for when logs do not contain the profile.
-						_, err = ptphelper.GetConfigForProfileFromVarRun(profileRegex, &testPtpPod, pkg.PtpContainerName)
+						_, err = ptphelper.GetConfigForProfileFromVarRun(profileFilePattern, &testPtpPod, pkg.PtpContainerName)
 						if err != nil {
 							Fail(fmt.Sprintf("could not get profile name, err=%s", err))
 						}
@@ -1906,12 +1928,16 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				masterConfigs, slaveConfigs := ptphelper.DiscoveryPTPConfiguration(pkg.PtpLinuxDaemonNamespace)
 				ptpConfigs := append(masterConfigs, slaveConfigs...)
 
-				fifoPriorities = make(map[string]int64)
+				fifoPriorities = nil
 				for _, config := range ptpConfigs {
 					for _, profile := range config.Spec.Profile {
 						if profile.PtpSchedulingPolicy != nil && *profile.PtpSchedulingPolicy == "SCHED_FIFO" {
-							if profile.PtpSchedulingPriority != nil {
-								fifoPriorities[ptphelper.QualifyProfileName(config.Name, *profile.Name)] = *profile.PtpSchedulingPriority
+							if profile.Name != nil && profile.PtpSchedulingPriority != nil {
+								fifoPriorities = append(fifoPriorities, struct {
+									configName  string
+									profileName string
+									priority    int64
+								}{config.Name, *profile.Name, *profile.PtpSchedulingPriority})
 							}
 						}
 					}
@@ -1926,15 +1952,17 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 			})
 			It("Should check whether using fifo scheduling", func() {
 				By("checking for chrt logs")
-				for name, priority := range fifoPriorities {
-					ptp4lLog := fmt.Sprintf("/bin/chrt -f %d /usr/sbin/ptp4l", priority)
+				for i := 0; i < len(fifoPriorities); {
+					fp := fifoPriorities[i]
+					ptp4lLog := fmt.Sprintf("/bin/chrt -f %d /usr/sbin/ptp4l", fp.priority)
+					matched := false
 					for podIndex := range ptpPods.Items {
-						profileName := fmt.Sprintf("Profile Name: %s", name)
+						profileLog := "Profile Name: " + ptphelper.ProfileNameMatchPattern(fp.configName, fp.profileName)
 						_, err := pods.GetPodLogsRegex(ptpPods.Items[podIndex].Namespace,
 							ptpPods.Items[podIndex].Name, pkg.PtpContainerName,
-							profileName, true, pkg.TimeoutIn3Minutes)
+							profileLog, false, pkg.TimeoutIn3Minutes)
 						if err != nil {
-							logrus.Errorf("error getting profile=%s, err=%s ", name, err)
+							logrus.Errorf("error getting profile=%s/%s, err=%s ", fp.configName, fp.profileName, err)
 							continue
 						}
 						_, err = pods.GetPodLogsRegex(ptpPods.Items[podIndex].Namespace,
@@ -1944,7 +1972,13 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 							logrus.Errorf("error getting ptp4l chrt line=%s, err=%s ", ptp4lLog, err)
 							continue
 						}
-						delete(fifoPriorities, name)
+						matched = true
+						break
+					}
+					if matched {
+						fifoPriorities = append(fifoPriorities[:i], fifoPriorities[i+1:]...)
+					} else {
+						i++
 					}
 				}
 				Expect(fifoPriorities).To(HaveLen(0))
@@ -3164,15 +3198,11 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 			)
 			Expect(err).NotTo(HaveOccurred())
 
-			// Daemon profiles are qualified: <configname>_<profilename>
-			qualifiedTT := ptphelper.QualifyProfileName(originalPtpConfig.Name, "tbc-tt")
-			qualifiedTR := ptphelper.QualifyProfileName(originalPtpConfig.Name, "tbc-tr")
-
 			// Discover TT config (for PMC) and TR config (daemon publishes clock_class metric under receiver)
 			nodeName := fullConfig.DiscoveredClockUnderTestPod.Spec.NodeName
-			cfgName, err := ptphelper.GetConfigForProfile(qualifiedTT, nil, &nodeName)
+			cfgName, err := ptphelper.GetConfigForProfile(originalPtpConfig.Name, "tbc-tt", nil, &nodeName)
 			Expect(err).NotTo(HaveOccurred())
-			trCfgName, err := ptphelper.GetConfigForProfile(qualifiedTR, nil, &nodeName)
+			trCfgName, err := ptphelper.GetConfigForProfile(originalPtpConfig.Name, "tbc-tr", nil, &nodeName)
 			Expect(err).NotTo(HaveOccurred())
 			ttNIC := ptptesthelper.NICInfo{
 				ConfigName:    strings.TrimPrefix(trCfgName, "/var/run/"),
