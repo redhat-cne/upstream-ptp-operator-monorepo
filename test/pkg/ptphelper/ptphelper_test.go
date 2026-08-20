@@ -27,6 +27,32 @@ func TestProfileNameMatchPattern(t *testing.T) {
 	}
 }
 
+func TestProfileNameLogPattern(t *testing.T) {
+	// GetPodLogsRegex appends \s*^ when isLiteralText is false.
+	const matchOnlyFullLines = `\s*^`
+	re, err := regexp.Compile(ProfileNameLogPattern("temp", "temp") + matchOnlyFullLines)
+	if err != nil {
+		t.Fatalf("compile pattern: %v", err)
+	}
+
+	unqualified := "I0819 10:48:18.897 daemon.go:410] Profile Name: temp\nnext line\n"
+	qualified := "I0819 10:48:18.897 daemon.go:410] Profile Name: temp_temp\nnext line\n"
+	if !re.MatchString(unqualified) {
+		t.Errorf("log pattern should match unqualified Profile Name line")
+	}
+	if !re.MatchString(qualified) {
+		t.Errorf("log pattern should match qualified Profile Name line")
+	}
+
+	oldRe, err := regexp.Compile("Profile Name: " + ProfileNameMatchPattern("temp", "temp") + matchOnlyFullLines)
+	if err != nil {
+		t.Fatalf("compile old pattern: %v", err)
+	}
+	if oldRe.MatchString(unqualified) {
+		t.Errorf("pattern without (?m) should not match a klog Profile Name line")
+	}
+}
+
 func TestGetProfileName(t *testing.T) {
 	t.Run("returns CR profile name without qualifying", func(t *testing.T) {
 		profileName := pkg.PtpTempPolicyName

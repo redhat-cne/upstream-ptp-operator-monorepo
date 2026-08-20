@@ -973,6 +973,12 @@ func ProfileNameMatchPattern(ptpConfigName, profileName string) string {
 	return fmt.Sprintf("(?:%s_)?%s", regexp.QuoteMeta(ptpConfigName), regexp.QuoteMeta(profileName))
 }
 
+// ProfileNameLogPattern is a daemon log regex for "Profile Name:" lines.
+// It includes (?m) because GetPodLogsRegex appends \s*^ when isLiteralText is false.
+func ProfileNameLogPattern(ptpConfigName, profileName string) string {
+	return `(?m)Profile Name: ` + ProfileNameMatchPattern(ptpConfigName, profileName)
+}
+
 // GetProfileName returns the profile name from a PtpConfig, matching against
 // the known set of test policy names. This whitelist prevents accidentally
 // selecting unrelated profiles (e.g. operator-internal ones).

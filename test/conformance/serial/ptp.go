@@ -535,9 +535,9 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				clockUnderTestConfig := (*ptpv1.PtpConfig)(fullConfig.DiscoveredClockUnderTestPtpConfig)
 				profileSlaveName, err := ptphelper.GetProfileName(clockUnderTestConfig, true)
 				Expect(err).NotTo(HaveOccurred(), "could not get clock-under-test profile name")
-				profileSlave := "Profile Name: " + ptphelper.ProfileNameMatchPattern(clockUnderTestConfig.Name, profileSlaveName)
+				profileSlave := ptphelper.ProfileNameLogPattern(clockUnderTestConfig.Name, profileSlaveName)
 				if fullConfig.PtpModeDesired == testconfig.TelcoBoundaryClock {
-					profileSlave = "Profile Name: (?:" +
+					profileSlave = `(?m)Profile Name: (?:` +
 						ptphelper.ProfileNameMatchPattern(clockUnderTestConfig.Name, "tbc-tr") + "|" +
 						ptphelper.ProfileNameMatchPattern(clockUnderTestConfig.Name, "tbc-tt") + ")"
 				}
@@ -546,7 +546,7 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 					gmConfig := (*ptpv1.PtpConfig)(fullConfig.DiscoveredGrandMasterPtpConfig)
 					gmProfileName, gmErr := ptphelper.GetProfileName(gmConfig, false)
 					Expect(gmErr).NotTo(HaveOccurred(), "could not get grandmaster profile name")
-					profileMaster = "Profile Name: " + ptphelper.ProfileNameMatchPattern(gmConfig.Name, gmProfileName)
+					profileMaster = ptphelper.ProfileNameLogPattern(gmConfig.Name, gmProfileName)
 				}
 
 				for podIndex := range ptpPods.Items {
@@ -999,7 +999,7 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				By("Waiting for daemon to load the temp profile", func() {
 					_, err := pods.GetPodLogsRegex(testPtpPod.Namespace,
 						testPtpPod.Name, pkg.PtpContainerName,
-						"Profile Name: "+ptphelper.ProfileNameMatchPattern(pkg.PtpTempPolicyName, pkg.PtpTempPolicyName), false, pkg.TimeoutIn3Minutes)
+						ptphelper.ProfileNameLogPattern(pkg.PtpTempPolicyName, pkg.PtpTempPolicyName), false, pkg.TimeoutIn3Minutes)
 					Expect(err).NotTo(HaveOccurred(), "daemon did not load temp profile in time")
 				})
 
@@ -1062,13 +1062,13 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				})
 
 				By("Checking the profile is reverted", func() {
-					profileLogPattern := "Profile Name: " + ptphelper.ProfileNameMatchPattern(policyName, policyName)
+					profileLogPattern := ptphelper.ProfileNameLogPattern(policyName, policyName)
 					profileFilePattern := ptphelper.ProfileNameMatchPattern(policyName, policyName)
 					if policyName == pkg.PTPWPCTBCPolicyName {
 						tbcPattern := "(?:" +
 							ptphelper.ProfileNameMatchPattern(policyName, "tbc-tr") + "|" +
 							ptphelper.ProfileNameMatchPattern(policyName, "tbc-tt") + ")"
-						profileLogPattern = "Profile Name: " + tbcPattern
+						profileLogPattern = `(?m)Profile Name: ` + tbcPattern
 						profileFilePattern = tbcPattern
 					}
 					_, err := pods.GetPodLogsRegex(testPtpPod.Namespace,
@@ -1957,7 +1957,7 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 					ptp4lLog := fmt.Sprintf("/bin/chrt -f %d /usr/sbin/ptp4l", fp.priority)
 					matched := false
 					for podIndex := range ptpPods.Items {
-						profileLog := "Profile Name: " + ptphelper.ProfileNameMatchPattern(fp.configName, fp.profileName)
+						profileLog := ptphelper.ProfileNameLogPattern(fp.configName, fp.profileName)
 						_, err := pods.GetPodLogsRegex(ptpPods.Items[podIndex].Namespace,
 							ptpPods.Items[podIndex].Name, pkg.PtpContainerName,
 							profileLog, false, pkg.TimeoutIn3Minutes)
