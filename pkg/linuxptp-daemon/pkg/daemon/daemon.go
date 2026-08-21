@@ -261,15 +261,52 @@ func (p *ProcessManager) UpdateSynceConfig(config *synce.Relations) {
 	p.process[0].syncERelations = config
 }
 
+// cfgNameFromMessageTag extracts the config label used by processStatus().
+// message_tag is "[ptp4l.0.config:{level}]" (non-HA phc2sys) or
+// "[phc2sys.0.config:{level}]" (HA). That is the series cmdRun flips on
+// start/stop; proc.configName is the on-disk file name (always phc2sys.N.config).
+func cfgNameFromMessageTag(messageTag string) string {
+	cfgName := strings.Replace(strings.Replace(messageTag, "]", "", 1), "[", "", 1)
+	if cfgName != "" {
+		cfgName = strings.Split(cfgName, MessageTagSuffixSeperator)[0]
+	}
+	return cfgName
+}
+
+// processStatusEmitConfig returns the config label for /emit-logs and whether
+// the process should be published. Delayed processes (skipInitialStartup set)
+// are omitted so CEP does not keep a sticky process_status=0 on a different
+// config label than cmdRun later uses.
+func processStatusEmitConfig(proc *ptpProcess) (cfgName string, emit bool) {
+	if proc == nil || proc.skipInitialStartup != "" {
+		return "", false
+	}
+	cfgName = cfgNameFromMessageTag(proc.messageTag)
+	if cfgName == "" {
+		cfgName = proc.configName
+	}
+	return cfgName, true
+}
+
 // EmitProcessStatusLogs emits process status logs using the EventHandler's
 // managed connection with reconnection support.
 func (p *ProcessManager) EmitProcessStatusLogs() {
 	for _, proc := range p.process {
+		if p.daemon != nil {
+			p.daemon.delayedStartupMu.Lock()
+		}
+		cfgName, emit := processStatusEmitConfig(proc)
+		if p.daemon != nil {
+			p.daemon.delayedStartupMu.Unlock()
+		}
+		if !emit {
+			continue
+		}
 		status := PtpProcessUp
 		if proc.Stopped() {
 			status = PtpProcessDown
 		}
-		p.ptpEventHandler.EmitProcessStatusLog(proc.name, proc.configName, status)
+		p.ptpEventHandler.EmitProcessStatusLog(proc.name, cfgName, status)
 	}
 }
 
@@ -1588,10 +1625,7 @@ func addScheduling(nodeProfile *ptpv1.PtpProfile, cmdLine string) string {
 }
 
 func processStatus(c net.Conn, processName, messageTag string, status int64) {
-	cfgName := strings.Replace(strings.Replace(messageTag, "]", "", 1), "[", "", 1)
-	if cfgName != "" {
-		cfgName = strings.Split(cfgName, MessageTagSuffixSeperator)[0]
-	}
+	cfgName := cfgNameFromMessageTag(messageTag)
 	// ptp4l[5196819.100]: [ptp4l.0.config] PTP_PROCESS_STOPPED:0/1
 
 	if c == nil {
