@@ -59,19 +59,19 @@ func BasicClockSyncCheck(fullConfig testconfig.TestConfig, ptpConfig *ptpv1.PtpC
 		logrus.Debugf("could not get nodeName because of err: %s", err)
 	}
 	var slaveMaster string
-	if fullConfig.PtpModeDesired == testconfig.Discovery {
-		slaveMaster, err = ptphelper.GetClockIDForeign(ptpConfig.Name, profileName, label, nodeName)
-	} else {
-		Eventually(func() error {
-			slaveMaster, err = ptphelper.GetClockIDForeign(ptpConfig.Name, profileName, label, nodeName)
-			if err != nil {
-				logrus.Infof("GetClockIDForeign retry due to err: %s", err)
-			}
-			return err
-		}, pkg.TimeoutIn3Minutes, pkg.Timeout10Seconds).Should(BeNil(),
-			fmt.Sprintf("Timeout to get foreign clock ID for ptpconfig %s", ptpConfig.Name))
-	}
 	if errProfile == nil {
+		if fullConfig.PtpModeDesired == testconfig.Discovery {
+			slaveMaster, err = ptphelper.GetClockIDForeign(ptpConfig.Name, profileName, label, nodeName)
+		} else {
+			Eventually(func() error {
+				slaveMaster, err = ptphelper.GetClockIDForeign(ptpConfig.Name, profileName, label, nodeName)
+				if err != nil {
+					logrus.Infof("GetClockIDForeign retry due to err: %s", err)
+				}
+				return err
+			}, pkg.TimeoutIn3Minutes, pkg.Timeout10Seconds).Should(BeNil(),
+				fmt.Sprintf("Timeout to get foreign clock ID for ptpconfig %s", ptpConfig.Name))
+		}
 		if fullConfig.PtpModeDesired == testconfig.Discovery {
 			if err != nil {
 				logrus.Infof("slave's Master not detected in log (probably because of log rollover))")
@@ -87,12 +87,12 @@ func BasicClockSyncCheck(fullConfig testconfig.TestConfig, ptpConfig *ptpv1.PtpC
 			}
 			logrus.Infof("slave's Master=%s", slaveMaster)
 		}
-	}
-	if gmID != nil {
-		if !strings.HasPrefix(slaveMaster, *gmID) {
-			logrus.Infof("slaveMaster=%s does not match expected GM=%s, waiting for re-sync...", slaveMaster, *gmID)
-			if waitErr := ptphelper.WaitForClockIDForeign(ptpConfig.Name, profileName, label, nodeName, *gmID); waitErr != nil {
-				return errors.Errorf("Slave connected to another (incorrect) Master, slaveMaster=%s, gmID=%s, waitErr=%s", slaveMaster, *gmID, waitErr)
+		if gmID != nil {
+			if !strings.HasPrefix(slaveMaster, *gmID) {
+				logrus.Infof("slaveMaster=%s does not match expected GM=%s, waiting for re-sync...", slaveMaster, *gmID)
+				if waitErr := ptphelper.WaitForClockIDForeign(ptpConfig.Name, profileName, label, nodeName, *gmID); waitErr != nil {
+					return errors.Errorf("Slave connected to another (incorrect) Master, slaveMaster=%s, gmID=%s, waitErr=%s", slaveMaster, *gmID, waitErr)
+				}
 			}
 		}
 	}
