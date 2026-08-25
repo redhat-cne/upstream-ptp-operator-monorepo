@@ -75,8 +75,9 @@ spec:
                           format: int64
                           type: integer
                         minOffsetThreshold:
-                          default: -100
-                          description: min offset in nano secs
+                          description: |-
+                            DEPRECATED: min offset in nano secs. This field is no longer used for offset-range evaluation; the system now evaluates abs(offset) against maxOffsetThreshold only. The field is retained for backward compatibility with existing PtpConfig resources and its value is ignored. Do not set this field in new configurations.
+                            Deprecated: MinOffsetThreshold is no longer used for offset-range evaluation; abs(offset) < MaxOffsetThreshold is evaluated instead.
                           format: int64
                           type: integer
                         processDowntimeThresholds:
