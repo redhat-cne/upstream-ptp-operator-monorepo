@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -332,10 +333,9 @@ func (g *GPSD) processGNSSLines(lines []string) {
 	}
 }
 
-// isOffsetInRange ... check if offset is in range
+// isOffsetInRange returns true when abs(offset) < GMThreshold.Max
+// (non-inclusive boundary). GMThreshold.Min is deprecated and intentionally
+// ignored here.
 func (g *GPSD) isOffsetInRange() bool {
-	if g.offset <= g.processConfig.GMThreshold.Max && g.offset >= g.processConfig.GMThreshold.Min {
-		return true
-	}
-	return false
+	return math.Abs(float64(g.offset)) < float64(g.processConfig.GMThreshold.Max)
 }

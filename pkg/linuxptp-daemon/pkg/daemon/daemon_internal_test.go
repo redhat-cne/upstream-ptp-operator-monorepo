@@ -3888,12 +3888,15 @@ func TestGetPTPThreshold(t *testing.T) {
 		expectedHoldover int64
 	}{
 		{
+			// MinOffsetThreshold is deprecated: the default (no explicit
+			// PtpClockThreshold on the profile) now resolves to 0, not a
+			// synthetic -100.
 			name: "default threshold without ntpfailover",
 			profile: ptpv1.PtpProfile{
 				Name: &profileName,
 			},
 			expectedMax:      100,
-			expectedMin:      -100,
+			expectedMin:      0,
 			expectedHoldover: 5,
 		},
 		{
@@ -3905,7 +3908,7 @@ func TestGetPTPThreshold(t *testing.T) {
 				},
 			},
 			expectedMax:      1000,
-			expectedMin:      -1000,
+			expectedMin:      0,
 			expectedHoldover: 5,
 		},
 		{
@@ -3917,10 +3920,12 @@ func TestGetPTPThreshold(t *testing.T) {
 				},
 			},
 			expectedMax:      100,
-			expectedMin:      -100,
+			expectedMin:      0,
 			expectedHoldover: 5,
 		},
 		{
+			// MinOffsetThreshold is deprecated and is never populated on the
+			// returned threshold, even when the profile explicitly sets it.
 			name: "explicit PtpClockThreshold takes precedence over ntpfailover",
 			profile: ptpv1.PtpProfile{
 				Name: &profileName,
@@ -3934,7 +3939,20 @@ func TestGetPTPThreshold(t *testing.T) {
 				},
 			},
 			expectedMax:      500,
-			expectedMin:      -500,
+			expectedMin:      0,
+			expectedHoldover: 10,
+		},
+		{
+			name: "explicit PtpClockThreshold with omitted or zero MinOffsetThreshold",
+			profile: ptpv1.PtpProfile{
+				Name: &profileName,
+				PtpClockThreshold: &ptpv1.PtpClockThreshold{
+					HoldOverTimeout:    10,
+					MaxOffsetThreshold: 500,
+				},
+			},
+			expectedMax:      500,
+			expectedMin:      0,
 			expectedHoldover: 10,
 		},
 	}
@@ -3945,6 +3963,114 @@ func TestGetPTPThreshold(t *testing.T) {
 			assert.Equal(t, tt.expectedMax, result.MaxOffsetThreshold)
 			assert.Equal(t, tt.expectedMin, result.MinOffsetThreshold)
 			assert.Equal(t, tt.expectedHoldover, result.HoldOverTimeout)
+		})
+	}
+}
+
+func Test_shouldFreeRun(t *testing.T) {
+	threshold100 := &ptpv1.PtpClockThreshold{
+		MaxOffsetThreshold: 100,
+		MinOffsetThreshold: -100,
+	}
+	threshold100OmittedMin := &ptpv1.PtpClockThreshold{
+		MaxOffsetThreshold: 100,
+		MinOffsetThreshold: 0,
+	}
+	threshold100AsymmetricMin := &ptpv1.PtpClockThreshold{
+		MaxOffsetThreshold: 100,
+		MinOffsetThreshold: -50,
+	}
+
+	tests := []struct {
+		name         string
+		currentState event.PTPState
+		offset       float64
+		threshold    *ptpv1.PtpClockThreshold
+		expected     bool
+	}{
+		{
+			name:         "already in HOLDOVER -> false",
+			currentState: event.PTP_HOLDOVER,
+			offset:       500,
+			threshold:    threshold100,
+			expected:     false,
+		},
+		{
+			name:         "already in FREERUN -> false",
+			currentState: event.PTP_FREERUN,
+			offset:       500,
+			threshold:    threshold100,
+			expected:     false,
+		},
+		{
+			name:         "in-range positive offset -> false",
+			currentState: event.PTP_LOCKED,
+			offset:       50,
+			threshold:    threshold100,
+			expected:     false,
+		},
+		{
+			name:         "in-range negative offset -> false",
+			currentState: event.PTP_LOCKED,
+			offset:       -50,
+			threshold:    threshold100,
+			expected:     false,
+		},
+		{
+			name:         "out-of-range positive offset -> true",
+			currentState: event.PTP_LOCKED,
+			offset:       150,
+			threshold:    threshold100,
+			expected:     true,
+		},
+		{
+			name:         "out-of-range negative offset -> true",
+			currentState: event.PTP_LOCKED,
+			offset:       -150,
+			threshold:    threshold100,
+			expected:     true,
+		},
+		{
+			name:         "exact positive boundary offset (non-inclusive) -> true",
+			currentState: event.PTP_LOCKED,
+			offset:       100,
+			threshold:    threshold100,
+			expected:     true,
+		},
+		{
+			name:         "exact negative boundary offset (non-inclusive) -> true",
+			currentState: event.PTP_LOCKED,
+			offset:       -100,
+			threshold:    threshold100,
+			expected:     true,
+		},
+		{
+			name:         "backward-compat: omitted MinOffsetThreshold in-range -> false",
+			currentState: event.PTP_LOCKED,
+			offset:       50,
+			threshold:    threshold100OmittedMin,
+			expected:     false,
+		},
+		{
+			name:         "backward-compat: omitted MinOffsetThreshold out-of-range negative -> true",
+			currentState: event.PTP_LOCKED,
+			offset:       -150,
+			threshold:    threshold100OmittedMin,
+			expected:     true,
+		},
+		{
+			name:         "backward-compat: asymmetric MinOffsetThreshold behaves identically using abs(offset) < Max -> false",
+			currentState: event.PTP_LOCKED,
+			offset:       -70,
+			threshold:    threshold100AsymmetricMin,
+			expected:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual := shouldFreeRun(tt.currentState, tt.offset, tt.threshold)
+			assert.Equal(t, tt.expected, actual, "shouldFreeRun result mismatch")
 		})
 	}
 }

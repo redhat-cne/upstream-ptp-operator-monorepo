@@ -902,16 +902,19 @@ func (d *DpllConfig) isInSpecOffsetInRange() bool {
 	return false
 }
 
+// isOffsetInRange returns true when abs(phaseOffset) < GMThreshold.Max
+// (non-inclusive boundary). GMThreshold.Min is deprecated and intentionally
+// ignored here.
 func (d *DpllConfig) isOffsetInRange() bool {
 	if d.hasFlag(FlagNoPhaseOffset) {
 		// Special case when the DPLL has no reported phase offset
 		return true
 	}
-	if d.phaseOffset <= d.processConfig.GMThreshold.Max && d.phaseOffset >= d.processConfig.GMThreshold.Min {
+	if math.Abs(float64(d.phaseOffset)) < float64(d.processConfig.GMThreshold.Max) {
 		return true
 	}
-	glog.Infof("dpll offset out of range: min %d, max %d, current %d",
-		d.processConfig.GMThreshold.Min, d.processConfig.GMThreshold.Max, d.phaseOffset)
+	glog.Infof("dpll offset out of range: max %d, current %d",
+		d.processConfig.GMThreshold.Max, d.phaseOffset)
 	return false
 }
 

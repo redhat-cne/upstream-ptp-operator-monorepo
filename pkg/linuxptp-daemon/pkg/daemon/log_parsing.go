@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"math"
 	"strings"
 	"time"
 
@@ -193,7 +194,7 @@ func processParsedEvent(process *ptpProcess, ptpEvent *parser.PTPEvent) {
 }
 
 // shouldFreeRun returns true if we’re not already in HOLDOVER or FREERUN
-// and the current offset breaches either threshold.
+// and the current offset breaches maxOffsetThreshold: abs(offset) >= maxOffsetThreshold.
 func shouldFreeRun(
 	currentState event.PTPState,
 	rawOffset float64,
@@ -203,6 +204,5 @@ func shouldFreeRun(
 		return false
 	}
 
-	ofs := int64(rawOffset)
-	return ofs >= th.MaxOffsetThreshold || ofs <= th.MinOffsetThreshold
+	return math.Abs(rawOffset) >= float64(th.MaxOffsetThreshold)
 }
