@@ -57,3 +57,11 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - ptp.openshift.io
+  resources:
+  - nodeptpdevices
+  verbs:
+  - get
+  - list
+  - watch
