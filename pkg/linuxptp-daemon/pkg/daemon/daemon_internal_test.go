@@ -2999,6 +2999,47 @@ func TestReady_StoppedProcessReportsNotReady(t *testing.T) {
 	assert.Contains(t, msg, phc2sysProcessName)
 }
 
+func TestCfgNameFromMessageTag(t *testing.T) {
+	assert.Equal(t, "ptp4l.0.config", cfgNameFromMessageTag("[ptp4l.0.config:{level}]"))
+	assert.Equal(t, "phc2sys.0.config", cfgNameFromMessageTag("[phc2sys.0.config:{level}]"))
+	assert.Equal(t, "ptp4l.0.config", cfgNameFromMessageTag("[ptp4l.0.config]"))
+	assert.Equal(t, "", cfgNameFromMessageTag(""))
+}
+
+func TestProcessStatusEmitConfig_SkipsDelayedAndUsesMessageTag(t *testing.T) {
+	cfg, emit := processStatusEmitConfig(nil)
+	assert.False(t, emit)
+	assert.Equal(t, "", cfg)
+
+	delayed := &ptpProcess{
+		name:               phc2sysProcessName,
+		configName:         "phc2sys.0.config",
+		messageTag:         "[ptp4l.0.config:{level}]",
+		skipInitialStartup: testSkipStartupReason,
+	}
+	cfg, emit = processStatusEmitConfig(delayed)
+	assert.False(t, emit, "delayed phc2sys must not publish process_status 0 under phc2sys.0.config")
+	assert.Equal(t, "", cfg)
+
+	running := &ptpProcess{
+		name:       phc2sysProcessName,
+		configName: "phc2sys.0.config",
+		messageTag: "[ptp4l.0.config:{level}]",
+	}
+	cfg, emit = processStatusEmitConfig(running)
+	assert.True(t, emit)
+	assert.Equal(t, "ptp4l.0.config", cfg, "non-HA phc2sys must use the cmdRun message_tag series")
+
+	ha := &ptpProcess{
+		name:       phc2sysProcessName,
+		configName: "phc2sys.0.config",
+		messageTag: "[phc2sys.0.config:{level}]",
+	}
+	cfg, emit = processStatusEmitConfig(ha)
+	assert.True(t, emit)
+	assert.Equal(t, "phc2sys.0.config", cfg)
+}
+
 func TestReady_DelayedPhc2sysNotReportedAsStopped(t *testing.T) {
 	// phc2sys is intentionally delayed (skipInitialStartup set): the pod
 	// should be considered ready without it.
