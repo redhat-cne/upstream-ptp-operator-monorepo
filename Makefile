@@ -49,7 +49,7 @@ BUNDLE_GEN_FLAGS ?= -q --overwrite --version $(BUNDLE_VERSION) $(BUNDLE_METADATA
 
 # Set the Operator SDK version to use. By default, what is installed on the system is used.
 # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
-OPERATOR_SDK_VERSION ?= v1.36.1-ocp
+OPERATOR_SDK_VERSION ?= v1.38.0-ocp
 
 # Image URL to use all building/pushing image targets
 IMG ?= ghcr.io/k8snetworkplumbingwg/ptp-operator:$(VERSION)
@@ -151,21 +151,49 @@ docker-push: ## Push docker image with the manager.
 
 ##@ Deployment
 
-install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build config/crd | kubectl $(KUBECONFIG_OPTS) apply -f -
+# FREE_RUN=1 renders the generated manifests (via kustomize build) to FREE_RUN_DIR instead
+# of applying/deleting them against a live cluster. This lets install/uninstall/deploy/undeploy
+# be exercised to verify the generated output is well-formed without requiring a reachable
+# Kubernetes/OpenShift API server (e.g. in CI or sandboxed dev environments).
+FREE_RUN ?= 0
+FREE_RUN_DIR ?= $(shell pwd)/_free-run
 
-uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build config/crd | kubectl $(KUBECONFIG_OPTS) delete -f - || true
+ifeq ($(FREE_RUN),1)
+APPLY_CMD = bash -o pipefail -c 'cat > "$(FREE_RUN_DIR)/$(1).yaml"'
+DELETE_CMD = bash -o pipefail -c 'cat > "$(FREE_RUN_DIR)/$(1).yaml"'
+else
+APPLY_CMD = kubectl $(KUBECONFIG_OPTS) apply -f -
+DELETE_CMD = kubectl $(KUBECONFIG_OPTS) delete -f - || true
+endif
 
-deploy: manifests kustomize update-env-yaml ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+.PHONY: install uninstall deploy undeploy
+install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config. Set FREE_RUN=1 to render to FREE_RUN_DIR instead of applying.
+ifeq ($(FREE_RUN),1)
+	@mkdir -p "$(FREE_RUN_DIR)"
+endif
+	$(KUSTOMIZE) build config/crd | $(call APPLY_CMD,install-crd)
+
+uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Set FREE_RUN=1 to render to FREE_RUN_DIR instead of deleting.
+ifeq ($(FREE_RUN),1)
+	@mkdir -p "$(FREE_RUN_DIR)"
+endif
+	$(KUSTOMIZE) build config/crd | $(call DELETE_CMD,uninstall-crd)
+
+deploy: manifests kustomize update-env-yaml ## Deploy controller to the K8s cluster specified in ~/.kube/config. Set FREE_RUN=1 to render to FREE_RUN_DIR instead of applying.
+ifeq ($(FREE_RUN),1)
+	@mkdir -p "$(FREE_RUN_DIR)"
+endif
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | kubectl $(KUBECONFIG_OPTS) apply -f -
-	$(KUSTOMIZE) build config/custom | kubectl $(KUBECONFIG_OPTS) apply -f -
+	$(KUSTOMIZE) build config/default | $(call APPLY_CMD,deploy-default)
+	$(KUSTOMIZE) build config/custom | $(call APPLY_CMD,deploy-custom)
 	@$(MAKE) restore-env-yaml
 
-undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build config/default | kubectl $(KUBECONFIG_OPTS) delete -f - || true
-	$(KUSTOMIZE) build config/custom | kubectl $(KUBECONFIG_OPTS) delete -f - || true
+undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Set FREE_RUN=1 to render to FREE_RUN_DIR instead of deleting.
+ifeq ($(FREE_RUN),1)
+	@mkdir -p "$(FREE_RUN_DIR)"
+endif
+	$(KUSTOMIZE) build config/default | $(call DELETE_CMD,undeploy-default)
+	$(KUSTOMIZE) build config/custom | $(call DELETE_CMD,undeploy-custom)
 
 ##@ Build Dependencies
 
@@ -208,9 +236,9 @@ operator-sdk: ## Download operator-sdk locally if necessary.
 ifneq ($(OPERATOR_SDK_VERSION),$(OPERATOR_SDK_VERSION_INSTALLED))
 ifeq ($(OS), Darwin)
 	mkdir -p $(LOCALBIN)/x86_64/
-	curl -L https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/operator-sdk/4.17.0/operator-sdk-v1.36.1-ocp-darwin-x86_64.tar.gz? | tar -xz -C bin/
+	curl -L https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/operator-sdk/4.18.22/operator-sdk-v1.38.0-ocp-darwin-x86_64.tar.gz? | tar -xz -C bin/
 else
-	curl -L https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/operator-sdk/4.17.0/operator-sdk-v1.36.1-ocp-linux-x86_64.tar.gz? | tar -xz -C bin/
+	curl -L https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/operator-sdk/4.18.22/operator-sdk-v1.38.0-ocp-linux-x86_64.tar.gz? | tar -xz -C bin/
 endif
 endif
 

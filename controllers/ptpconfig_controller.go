@@ -59,7 +59,7 @@ type PtpConfigReconciler struct {
 //+kubebuilder:rbac:groups=ptp.openshift.io,resources=ptpconfigs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=ptp.openshift.io,resources=ptpconfigs/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=ptp.openshift.io,resources=ptpconfigs/finalizers,verbs=update
-//+kubebuilder:rbac:groups=ptp.openshift.io,resources=nodeptpdevices,verbs=get;list;watch
+//+kubebuilder:rbac:groups=ptp.openshift.io,resources=nodeptpdevices,verbs=get;list;watch;create
 //+kubebuilder:rbac:groups=ptp.openshift.io,resources=hardwareconfigs,verbs=get;list;watch
 //+kubebuilder:rbac:groups=config.openshift.io,resources=infrastructures,verbs=get;list;watch
 
