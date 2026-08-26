@@ -1,0 +1,10 @@
+name: "linuxptp-daemon: Run Jobs on PR"
+on:
+  pull_request:
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+
+jobs:
+  pr-update:
+    uses: redhat-cne/upstream-ptp-operator-monorepo/.github/workflows/_reusable-linuxptp-daemon-pr-update.yml@main
+    secrets: inherit

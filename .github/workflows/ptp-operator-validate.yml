@@ -1,0 +1,6 @@
+name: "ptp-operator: Validate"
+on: [push, pull_request]
+
+jobs:
+  validate:
+    uses: redhat-cne/upstream-ptp-operator-monorepo/.github/workflows/_reusable-ptp-operator-validate.yml@main

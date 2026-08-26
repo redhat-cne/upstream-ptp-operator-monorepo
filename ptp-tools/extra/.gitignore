@@ -1,2 +1,0 @@
-# Local/custom linuxptp RPMs copied here at build time; do not commit binaries.
-*.rpm

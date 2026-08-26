@@ -1,0 +1,47 @@
+name: "Reusable: linuxptp-daemon Push image on merge to main"
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/linuxptp-daemon
+  BUILD_PLATFORMS: linux/amd64
+  image-push-owner: 'k8snetworkplumbingwg'
+
+jobs:
+  build-and-push-image-linuxptp-daemon:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pkg/linuxptp-daemon
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker
+        if: ${{ github.repository_owner == env.image-push-owner }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linuxptp-daemon
+        if: ${{ github.repository_owner == env.image-push-owner }}
+        uses: docker/build-push-action@v5
+        with:
+          context: pkg/linuxptp-daemon
+          push: true
+          platforms: linux/amd64
+          sbom: false
+          provenance: false
+          tags: |
+            ghcr.io/${{ github.repository }}/linuxptp-daemon:latest
+            ghcr.io/${{ github.repository }}/linuxptp-daemon:${{ github.sha }}
+          file: pkg/linuxptp-daemon/Dockerfile

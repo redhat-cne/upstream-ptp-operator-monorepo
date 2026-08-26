@@ -1,0 +1,13 @@
+name: "linuxptp-daemon: Go mod tidy and vendor"
+on:
+  push:
+    branches: ["main", "one-repo*", "release-*"]
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+  pull_request:
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+
+jobs:
+  check:
+    uses: redhat-cne/upstream-ptp-operator-monorepo/.github/workflows/_reusable-linuxptp-daemon-check-go-mod-vendor.yml@main

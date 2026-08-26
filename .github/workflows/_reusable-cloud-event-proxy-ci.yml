@@ -1,0 +1,49 @@
+name: "Reusable: cloud-event-proxy CI"
+on:
+  workflow_call:
+
+jobs:
+  golangci:
+    name: Linting
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: pkg/cloud-event-proxy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.23
+      - name: tidy
+        run: go mod tidy
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64
+          args: --timeout 3m0s
+          working-directory: pkg/cloud-event-proxy
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: pkg/cloud-event-proxy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.23
+      - name: tidy
+        run: go mod tidy && go mod vendor
+      - name: Run Test Scripts
+        run: |
+          GO_VER=$(grep '^go ' go.mod | awk '{print $2}')
+          GO_MAJOR=$(echo "$GO_VER" | cut -d. -f1)
+          GO_MINOR=$(echo "$GO_VER" | cut -d. -f2)
+          if [ "$GO_MAJOR" -eq 1 ] && [ "$GO_MINOR" -lt 21 ]; then
+            echo "Skipping: Go $GO_VER is too old for plugin-based tests with Go 1.23 runner"
+            exit 0
+          fi
+          make gha
