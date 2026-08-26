@@ -334,6 +334,14 @@ spec:
           - get
           - patch
           - update
+        - apiGroups:
+          - ptp.openshift.io
+          resources:
+          - nodeptpdevices
+          verbs:
+          - get
+          - list
+          - watch
         serviceAccountName: ptp-operator
       deployments:
       - name: ptp-operator
@@ -370,6 +378,7 @@ spec:
                   value: quay.io/openshift/origin-kube-rbac-proxy:5.0
                 - name: SIDECAR_EVENT_IMAGE
                   value: quay.io/openshift/origin-cloud-event-proxy:5.0
+                - name: EVENT_PROXY_IMAGE
                 - name: OPERATOR_NAMESPACE
                   valueFrom:
                     fieldRef:

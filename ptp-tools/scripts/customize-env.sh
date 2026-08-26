@@ -2,6 +2,11 @@
 IMG_PREFIX=$1
 ENV_PATH=$2
 
+EVENT_PROXY_IMAGE=""
+if [[ "${ENABLE_CEPV2:-}" == "true" ]]; then
+  EVENT_PROXY_IMAGE="$IMG_PREFIX:cepv2"
+fi
+
 cat <<EOF > $ENV_PATH/env.yaml
 apiVersion: apps/v1
 kind: Deployment
@@ -25,6 +30,8 @@ spec:
               value: "$IMG_PREFIX:krp"
             - name: SIDECAR_EVENT_IMAGE
               value: "$IMG_PREFIX:cep"
+            - name: EVENT_PROXY_IMAGE
+              value: "$EVENT_PROXY_IMAGE"
             - name: IMAGE_PULL_POLICY
               value: "Always"
 EOF

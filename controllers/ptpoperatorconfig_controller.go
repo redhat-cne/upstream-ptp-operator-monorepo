@@ -235,6 +235,7 @@ func (r *PtpOperatorConfigReconciler) syncLinuxptpDaemon(ctx context.Context, de
 	data.Data["ReleaseVersion"] = os.Getenv("RELEASEVERSION")
 	data.Data["KubeRbacProxy"] = os.Getenv("KUBE_RBAC_PROXY_IMAGE")
 	data.Data["SideCar"] = os.Getenv("SIDECAR_EVENT_IMAGE")
+	data.Data["SideCarV2"] = os.Getenv("EVENT_PROXY_IMAGE")
 	data.Data["NodeName"] = os.Getenv("NODE_NAME")
 	data.Data["StorageType"] = DefaultStorageType
 	data.Data["EventApiVersion"] = DefaultApiVersion
