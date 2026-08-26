@@ -150,8 +150,8 @@ type PtpClockThreshold struct {
 	// +kubebuilder:default=100
 	// max offset in nano secs
 	MaxOffsetThreshold int64 `json:"maxOffsetThreshold,omitempty"`
-	// +kubebuilder:default=-100
-	// min offset in nano secs
+	// DEPRECATED: min offset in nano secs. This field is no longer used for offset-range evaluation; the system now evaluates abs(offset) against maxOffsetThreshold only. The field is retained for backward compatibility with existing PtpConfig resources and its value is ignored. Do not set this field in new configurations.
+	// Deprecated: MinOffsetThreshold is no longer used for offset-range evaluation; abs(offset) < MaxOffsetThreshold is evaluated instead.
 	MinOffsetThreshold int64 `json:"minOffsetThreshold,omitempty"`
 	// Acceptable process downtime in seconds for each process
 	ProcessDowntimeThresholds *ProcessDowntimeThresholds `json:"processDowntimeThresholds,omitempty"`
