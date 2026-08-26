@@ -1,0 +1,484 @@
+package metrics
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/alias"
+	"github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/ptp4lconf"
+	"github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/stats"
+	"github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/types"
+	"github.com/redhat-cne/sdk-go/pkg/event/ptp"
+	log "github.com/sirupsen/logrus"
+)
+
+var (
+	configFileRegEx = regexp.MustCompile(`(ptp4l|ts2phc|phc2sys|synce4l|chronyd)\.[0-9]*\.config`)
+	// NodeName from the env
+	ptpNodeName          = ""
+	masterOffsetSource   = ""
+	chronydValidSource   = regexp.MustCompile(`Selected source`)
+	chronydNoValidSource = regexp.MustCompile(`no selectable sources`)
+)
+
+const (
+	ptpNamespace = "openshift"
+	ptpSubsystem = "ptp"
+
+	phc2sysProcessName = "phc2sys"
+	ptp4lProcessName   = "ptp4l"
+	ts2phcProcessName  = "ts2phc"
+	gnssProcessName    = "gnss"
+	dpllProcessName    = "dpll"
+	gmProcessName      = "GM"
+	bcProcessName      = "T-BC"
+	syncE4lProcessName = "synce4l"
+	chronydProcessName = "chronyd"
+
+	unLocked     = "s0"
+	clockStep    = "s1"
+	locked       = "s2"
+	lockedStable = "s3"
+
+	// FreeRunOffsetValue when sync state is FREERUN
+	FreeRunOffsetValue = -9999999999999999
+	// ClockRealTime is the slave
+	ClockRealTime = "CLOCK_REALTIME"
+	// MasterClockType is the slave sync slave clock to master
+	MasterClockType = "master"
+	// GNSS ...
+	GNSS = "GNSS"
+	// DPLL ...
+	DPLL = "DPLL"
+	// ClockClass number
+	ClockClass = "CLOCK_CLASS"
+	// TBC ...
+	TBC = "T-BC"
+
+	// from the logs
+	processNameIndex = 0
+	configNameIndex  = 2
+
+	// from the logs
+	offset = "offset"
+	rms    = "rms"
+
+	// offset source
+	phc    = "phc"
+	sys    = "sys"
+	master = "master"
+	// PtpProcessDown ... process is down
+	PtpProcessDown int64 = 0
+	// PtpProcessUp process is up
+	PtpProcessUp int64 = 1
+
+	// UNAVAILABLE Nmea and Pps status
+	UNAVAILABLE float64 = 0
+	// AVAILABLE Nmea and Pps status
+	AVAILABLE float64 = 1
+
+	gnssStatus      = "gnss_status"
+	frequencyStatus = "frequency_status"
+	phaseStatus     = "phase_status"
+	ppsStatus       = "pps_status"
+)
+
+// phc2sysSelectionSettleDelay waits for the rest of a reconfigure burst
+// (e.g. "selecting CLOCK_REALTIME for synchronization") before treating a
+// NIC-only sink selection as OS-clock undisciplined (finalised by silence).
+var phc2sysSelectionSettleDelay = 200 * time.Millisecond
+
+// ExtractMetrics ... extract metrics from ptp logs.
+func (p *PTPEventManager) ExtractMetrics(msg string) {
+	p.extractMu.Lock()
+	defer p.extractMu.Unlock()
+	defer func() {
+		if err := recover(); err != nil {
+			log.Errorf("restored from extract metrics and events: %s", err)
+			log.Errorf("failed to extract %s", msg)
+		}
+	}()
+	replacer := strings.NewReplacer("[", " ", "]", " ", ":", " ")
+	output := replacer.Replace(msg)
+	fields := strings.Fields(output)
+	// make sure configName is found in logs
+	index := FindInLogForCfgFileIndex(output)
+	if index == -1 {
+		log.Errorf("config name is not found in log output %s", output)
+		return
+	}
+	if len(fields) < 3 {
+		log.Errorf("ignoring log:log is not in required format ptp4l/phc2sys[time]: [config] %s", output)
+		return
+	}
+	processName := fields[processNameIndex]
+	configName := fields[configNameIndex]
+	log.Debugf("ExtractMetrics: process=%s config=%s msg=%.100s", processName, configName, msg)
+	// if log is having ts2phc then it will replace it with ptp4l
+	configName = strings.Replace(configName, ts2phcProcessName, ptp4lProcessName, 1)
+	ptp4lCfg := p.GetPTPConfig(types.ConfigName(configName))
+
+	// ptp stats goes by config either ptp4l ot pch2sys
+	// master (slave) interface can be configured in ptp4l but  offset provided by ts2phc
+	ptpStats := p.GetStats(types.ConfigName(configName))
+	profileName := ptp4lCfg.Profile
+
+	// Check for process status FIRST, before profile validation
+	// Process status messages should always be processed regardless of profile configuration
+	if strings.Contains(output, ptpProcessStatusIdentifier) {
+		if status, err := p.parsePTPStatus(output, fields); err == nil {
+			log.Debugf("ExtractMetrics: process status detected: process=%s config=%s status=%d", processName, configName, status)
+			if status == PtpProcessDown {
+				p.processDownEvent(profileName, processName, ptpStats, ptp4lCfg.ProfileType)
+			}
+		} else {
+			log.Errorf("error in process status %s: %v", output, err)
+		}
+		return
+	}
+
+	//TODO: need better validation here
+	if processName == syncE4lProcessName && configName == "" { // hack to skip for synce4l
+		log.Infof("%s skipped parsing %s output %s\n", processName, configName, output)
+		return
+	} else if processName != syncE4lProcessName &&
+		!p.validLogToProcess(profileName, processName, len(ptp4lCfg.Interfaces)) {
+		log.Infof("%s skipped parsing %s output %s\n", processName, ptp4lCfg.Name, output)
+		return
+	}
+	var ptpInterface ptp4lconf.PTPInterface
+	// Initialize master and clock_realtime offset stats for the config
+	if _, found := ptpStats[master]; found {
+		// initialize master offset
+		masterOffsetSource = ptpStats[master].ProcessName()
+	}
+	switch processName {
+	case gnssProcessName:
+		p.ParseGNSSLogs(processName, configName, output, fields, ptpStats)
+	case dpllProcessName:
+		p.ParseDPLLLogs(processName, configName, output, fields, ptpStats)
+	case gmProcessName:
+		p.ParseGMLogs(processName, configName, output, fields, ptpStats)
+	case bcProcessName:
+		p.ParseTBCLogs(processName, configName, output, fields, ptpStats)
+	case syncE4lProcessName:
+		p.ParseSyncELogs(processName, configName, output, fields, ptpStats)
+	case chronydProcessName:
+		ptpStats.CheckSource(ClockRealTime, configName, processName)
+		ptpStats[ClockRealTime].SetProcessName(processName)
+		if chronydValidSource.MatchString(output) {
+			UpdateSyncStateMetrics(chronydProcessName, ClockRealTime, ptp.LOCKED)
+			p.clearStaleClockRealTimeMetric(profileName, chronydProcessName)
+			p.GenPTPEvent(profileName, ptpStats[ClockRealTime], ClockRealTime, int64(0), ptp.LOCKED, ptp.OsClockSyncStateChange)
+		} else if chronydNoValidSource.MatchString(output) {
+			UpdateSyncStateMetrics(chronydProcessName, ClockRealTime, ptp.FREERUN)
+			p.clearStaleClockRealTimeMetric(profileName, chronydProcessName)
+			p.GenPTPEvent(profileName, ptpStats[ClockRealTime], ClockRealTime, int64(0), ptp.FREERUN, ptp.OsClockSyncStateChange)
+		}
+	default:
+		if strings.Contains(output, " max ") { // this get generated in case -u is passed as an option to phy2sys opts
+			//TODO: ts2phc rms is validated
+			interfaceName, ptpOffset, maxPtpOffset, frequencyAdjustment, delay := extractSummaryMetrics(processName, output)
+			switch interfaceName {
+			case ClockRealTime:
+				UpdatePTPMetrics(phc, processName, interfaceName, ptpOffset, maxPtpOffset, frequencyAdjustment, delay)
+			case MasterClockType:
+				ptpInterface, _ = ptp4lCfg.ByRole(types.SLAVE)
+				if ptpInterface.Name != "" {
+					aliasValue := alias.GetAlias(ptpInterface.Name)
+					ptpStats[master].SetAlias(aliasValue)
+					UpdatePTPMetrics(master, processName, aliasValue, ptpOffset, maxPtpOffset, frequencyAdjustment, delay)
+				} else {
+					// this should not happen
+					log.Errorf("metrics found for empty interface %s", output)
+				}
+			default:
+				if processName == ts2phcProcessName {
+					aliasValue := alias.GetAlias(interfaceName)
+					ptpStats[master].SetAlias(aliasValue)
+					UpdatePTPMetrics(master, processName, aliasValue, ptpOffset, maxPtpOffset, frequencyAdjustment, delay)
+				}
+			}
+		} else if strings.Contains(output, "nmea_status") &&
+			processName == ts2phcProcessName {
+			// ts2phc[1699929121]:[ts2phc.0.config] ens2f0 nmea_status 0 offset 999999 s0
+			interfaceName, status, _, _ := extractNmeaMetrics(processName, output)
+			// ts2phc return actual interface name unlike ptp4l
+			ptpInterface = ptp4lconf.PTPInterface{Name: interfaceName}
+			aliasValue := alias.GetAlias(interfaceName)
+			// no event for nmeas status , change in GM will manage ptp events and sync states
+			UpdateNmeaStatusMetrics(processName, aliasValue, status)
+		} else if strings.Contains(output, "process_status") &&
+			processName == ts2phcProcessName {
+			// do nothing processDown identifier will update  metrics and stats
+			// but prevent further from reading offsets
+			return
+		} else if processName == phc2sysProcessName &&
+			p.handlePhc2sysSyncDirection(profileName, configName, output, fields, ptpStats) {
+			return
+		} else if strings.Contains(output, " offset ") { //  DPLL has Offset too
+			// ptp4l[5196819.100]: [ptp4l.0.config] master offset   -2162130 s2 freq +22451884 path delay    374976
+			// phc2sys[4268818.286]: [ptp4l.0.config] CLOCK_REALTIME phc offset       -62 s0 freq  -78368 delay   1100
+			// phc2sys[4268818.287]: [ptp4l.0.config] ens5f0 phc offset       -47 s2 freq   -2047 delay   2438
+			// ts2phc[82674.465]: [ts2phc.0.cfg] ens2f1 master offset          0 s2 freq      -0
+			// ts2phc[82674.465]: ts2phc.0.config] ens7f0       offset         1  s3 freq      +1 holdover
+			// Use threshold to CLOCK_REALTIME==SLAVE, rest send clock state to metrics no events
+			// db                      | oc/bc/dual | ts2phc wo/GNSS     | ts2phc w/GNSS       | two card
+			// --------------------------------------------------------------------------------------------
+			// stats[master]           | No deps    |has ts2phc state/of | has GNSS deps+state | same
+			// stats[CLOCK_REALTIME]   | no deps    |has clock_realtime  | same                | same
+			// stats[ens01]            |  NA        | NA                 | has dpll deps + ts2phc offset + sate | same
+			// | ineterfacename | Process
+			// | master         | ptp4l
+			// | CLOCK_REALTIME | phc2sys
+			// | ens01          |  ts2phc (mostly)
+			interfaceName, ptpOffset, _, frequencyAdjustment, delay, syncState := extractRegularMetrics(processName, output)
+			if interfaceName == "" {
+				return // don't do if iface not known
+			}
+			log.Debugf("ExtractMetrics: offset parsed: process=%s iface=%s offset=%.0f syncState=%s", processName, interfaceName, ptpOffset, syncState)
+			if processName == phc2sysProcessName {
+				handlePhc2sysOffsetSyncDirection(profileName, configName, interfaceName, ptpStats)
+			}
+			//  only ts2phc process will return actual interface name- allow all ts2phcprocess or iface in (master or  clock realtime)
+			if processName != ts2phcProcessName && interfaceName != master && interfaceName != ClockRealTime {
+				return // only master and clock_realtime are supported
+			}
+			// Force FREERUN if gnss is FREERUN and ts2phc is the source
+			if processName != ts2phcProcessName && masterOffsetSource == ts2phcProcessName && p.lastOverallGMState == ptp.FREERUN {
+				syncState = ptp.FREERUN
+			}
+			offsetSource := master
+			if strings.Contains(output, "sys offset") {
+				offsetSource = sys
+			} else if strings.Contains(output, "phc offset") {
+				offsetSource = phc
+			}
+			// here interfaceName will be master , clock_realtime and ens2f0
+			// interfaceType will be of only two kind master and clock_realtime
+			// ts2phc process always reports interface as of now
+			if processName == ts2phcProcessName { // if current offset is read from ts2phc
+				// ts2phc return actual interface name unlike ptp4l
+				ptpInterface = ptp4lconf.PTPInterface{Name: interfaceName}
+				// create GM interfaces
+				ptpStats.CheckSource(master, configName, processName)
+				// update process name in master since phc2sys looks for it
+				ptpStats[master].SetProcessName(processName)
+				ptpStats[master].SetOffsetSource(offsetSource)
+			} else {
+				// for ts2phc there is no slave interface configuration
+				// fort pt4l find the slave configured
+				ptpInterface, _ = ptp4lCfg.ByRole(types.SLAVE)
+			}
+			ptpStats.CheckSource(types.IFace(interfaceName), configName, processName)
+			ptpStats[types.IFace(interfaceName)].SetOffsetSource(offsetSource)
+			// Process Name will get Updated when master offset is ts2phc for master
+			ptpStats[types.IFace(interfaceName)].SetProcessName(processName)
+			ptpStats[types.IFace(interfaceName)].SetFrequencyAdjustment(int64(frequencyAdjustment))
+			ptpStats[types.IFace(interfaceName)].SetDelay(int64(delay))
+			// Handling GM clock state- syncState is used for events
+			// IF its GM then synState is last syncState of GM
+			// TODO: understand if the config is GM /BC /OC
+			switch interfaceName { //note: this is not  interface type
+			case ClockRealTime: // CLOCK_REALTIME is active slave interface
+				// O-RAN O-Cloud API v04.00 Table 37: E3 = worst_of(phc2sys_state, E1_state).
+				// phc2sys publishes E3, but E3 cannot be LOCKED unless E1 is also LOCKED.
+
+				// E1 lookup key: T-BC → "T-BC"; T-GM/OC/BC → "master".
+				// T-BC/T-GM set E1 from delayed X-STATUS lines (T-BC-STATUS / T-GM-STATUS),
+				// so missing E1 defaults to FREERUN. OC/BC set E1 from ptp4l, so leave it unset.
+				var e1State ptp.SyncState
+				mainClockKey := ptpStats.GetMainClockName()
+				switch p.GetProfileTypeByConfigName(types.ConfigName(configName)) {
+				case ptp4lconf.TBC:
+					mainClockKey = types.IFace(stats.TBCMainClockName)
+					e1State = ptp.FREERUN
+				case ptp4lconf.TGM:
+					e1State = ptp.FREERUN
+				}
+				if e1Stat, ok := ptpStats[mainClockKey]; ok && e1Stat.LastSyncState() != "" {
+					e1State = e1Stat.LastSyncState()
+				}
+				if e1State != "" {
+					syncState = OverallState(syncState, e1State)
+				}
+
+				//  for HA we can not rely on master ;since there will be 2 or more leaders; this condition will be skipped
+				// ptpStats clock realtime has its own stats objects
+				if r, ok := ptpStats[master]; ok && r.Role() == types.SLAVE { // publish event only if the master role is active
+					// when related slave is faulty the holdover will make clock clear time as FREERUN
+					p.GenPTPEvent(profileName, ptpStats[ClockRealTime], interfaceName, int64(ptpOffset), syncState, ptp.OsClockSyncStateChange)
+				} else if masterOffsetSource == ts2phcProcessName {
+					//TODO: once ts2phc events are identified we need to add that here, meaning if GM state is FREERUN then set OSClock as FREERUN
+					// right now we are not managing os clock state based on GM state
+					p.GenPTPEvent(profileName, ptpStats[ClockRealTime], interfaceName, int64(ptpOffset), syncState, ptp.OsClockSyncStateChange)
+				}
+
+				if _, ok := ptpStats[master]; ok { // ha wont have both master and clockreal_time
+					ptpStats[ClockRealTime].SetAlias(ptpStats[master].Alias())
+					p.GenPTPEvent(profileName, ptpStats[ClockRealTime], interfaceName, int64(ptpOffset), syncState, ptp.OsClockSyncStateChange)
+				} else { // for HA to send event without monitoring leaders
+					//TODO : manage leaders to trigger events in case of HA pick profile name as alias
+					ptpStats[ClockRealTime].SetAlias("ptp-ha-enabled")
+					p.GenPTPEvent(profileName, ptpStats[ClockRealTime], interfaceName, int64(ptpOffset), syncState, ptp.OsClockSyncStateChange)
+				}
+				// continue to update metrics regardless and stick to last sync state
+				UpdateSyncStateMetrics(processName, interfaceName, ptpStats[ClockRealTime].LastSyncState())
+				if processName == phc2sysProcessName {
+					p.clearStaleClockRealTimeMetric(profileName, phc2sysProcessName)
+				}
+				UpdatePTPMetrics(offsetSource, processName, interfaceName, ptpOffset, float64(ptpStats[ClockRealTime].MaxAbs()), frequencyAdjustment, delay)
+			case MasterClockType: // this ptp4l[5196819.100]: [ptp4l.0.config] master offset   -2162130 s2 freq +22451884 path delay
+				// Report events for master  by masking the index  number of the slave interface
+				if ptpInterface.Name != "" {
+					aliasValue := alias.GetAlias(ptpInterface.Name)
+					if ptpStats[types.IFace(interfaceName)].Alias() != aliasValue {
+						ptpStats[types.IFace(interfaceName)].SetAlias(aliasValue)
+					}
+					// forT-BC only update metrics/ but we are missing maxAbs for T-BC, fro now it will use  T-BC offsets
+					UpdatePTPMetrics(offsetSource, processName, aliasValue, ptpOffset, float64(ptpStats[types.IFace(interfaceName)].MaxAbs()),
+						frequencyAdjustment, delay)
+					// TBC does not trigger event for master offset
+					// For TBC, ptp4l clock_state comes directly from log (s0/s2), never HOLDOVER
+					if ptp4lCfg.ProfileType != ptp4lconf.TBC {
+						masterResource := fmt.Sprintf("%s/%s", aliasValue, MasterClockType)
+						p.GenPTPEvent(profileName, ptpStats[types.IFace(interfaceName)], masterResource, int64(ptpOffset), syncState, ptp.PtpStateChange)
+						UpdateSyncStateMetrics(processName, aliasValue, ptpStats[types.IFace(interfaceName)].LastSyncState())
+					} else {
+						// For TBC: store and use current syncState from log (s0/s2 only, no HOLDOVER)
+						ptpStats[types.IFace(interfaceName)].SetLastSyncState(syncState)
+						UpdateSyncStateMetrics(processName, aliasValue, syncState)
+					}
+					ptpStats[types.IFace(interfaceName)].AddValue(int64(ptpOffset))
+				}
+			default: // for ts2phc the master stats are not updated at all, so rely on interface
+				if processName == ts2phcProcessName {
+					aliasValue := alias.GetAlias(ptpInterface.Name)
+					if ptpStats[types.IFace(interfaceName)].Alias() != aliasValue {
+						ptpStats[types.IFace(interfaceName)].SetAlias(aliasValue)
+					}
+					// update ts2phc sync state to GM state if available,since GM State identifies PTP state
+					// This identifies sync state of GM and adds ts2phc offset to verify if it has to stay in GM state or set new state
+					// based on ts2phc offset threshold : Which is unnecessary but to avoid breaking existing logic
+					// let the check happen again : GM state published by linuxptp-daemon already have checked ts2phc offset
+					// TO GM State we need to know GM interface ; here MASTER stats will hold data of GM
+					// and GM state will be held as dependant of master key
+					masterResource := fmt.Sprintf("%s/%s", aliasValue, MasterClockType)
+					// use gm state to identify syncState
+					// master will hold multiple ts2phc state as one state based on GM state
+					// HANDLE case where there is no GM status but only ts2phc
+					if !ptpStats[master].HasProcessEnabled(gmProcessName) && ptp4lCfg.ProfileType != ptp4lconf.TBC {
+						p.GenPTPEvent(profileName, ptpStats[types.IFace(interfaceName)], masterResource, int64(ptpOffset), syncState, ptp.PtpStateChange)
+					} else {
+						threshold := p.PtpThreshold(profileName, false)
+						if syncState != ptp.HOLDOVER && !isOffsetInRange(int64(ptpOffset), threshold.MaxOffsetThreshold) {
+							syncState = ptp.FREERUN
+						}
+						ptpStats[types.IFace(interfaceName)].SetLastSyncState(syncState)
+						ptpStats[types.IFace(interfaceName)].SetLastOffset(int64(ptpOffset))
+						ptpStats[types.IFace(interfaceName)].AddValue(int64(ptpOffset))
+					}
+					UpdateSyncStateMetrics(processName, aliasValue, ptpStats[types.IFace(interfaceName)].LastSyncState())
+					UpdatePTPMetrics(offsetSource, processName, aliasValue, ptpOffset, float64(ptpStats[types.IFace(interfaceName)].MaxAbs()),
+						frequencyAdjustment, delay)
+				}
+			}
+		} else if processName == phc2sysProcessName &&
+			strings.Contains(output, "ptp_ha_profile") {
+			if profile, state, _ := extractPTPHaMetrics(processName, output); state > -1 {
+				UpdatePTPHaMetrics(profile, state)
+			}
+		}
+	}
+	p.ParsePTP4l(processName, configName, profileName, output, fields,
+		ptpInterface, ptp4lCfg, ptpStats)
+}
+
+// clearStaleClockRealTimeMetric removes the openshift_ptp_clock_state
+// CLOCK_REALTIME series belonging to the counterpart process (phc2sys <->
+// chronyd) once activeProcessName actively reports its own CLOCK_REALTIME
+// state. This only applies to NTP/GNSS-failover profiles where both phc2sys
+// and chronyd are configured, since in that scenario exactly one of the two
+// processes owns CLOCK_REALTIME at any given time. Without this cleanup, the
+// previously active process' last-known state lingers forever, resulting in
+// two (potentially conflicting) CLOCK_REALTIME time series being exposed at
+// once.
+func (p *PTPEventManager) clearStaleClockRealTimeMetric(profileName, activeProcessName string) {
+	opts := p.PtpConfigMapUpdates.LookupPtpProcessOpts(profileName)
+	if opts == nil || !opts.Phc2SysEnabled() || !opts.ChronydEnabled() {
+		return
+	}
+	counterpart := chronydProcessName
+	if activeProcessName == chronydProcessName {
+		counterpart = phc2sysProcessName
+	}
+	DeleteSyncStateMetrics(counterpart, ClockRealTime)
+}
+
+func (p *PTPEventManager) processDownEvent(profileName, processName string, ptpStats stats.PTPStats, profileType ptp4lconf.PtpProfileType) {
+	// if the process is responsible to set master offset
+	if processName == ts2phcProcessName {
+		//  update metrics for all interface defined by ts2phc
+		//  set ts2phc stats to FREERUN
+		// this should generate PTP stat as free run by event manager
+		for iface := range ptpStats {
+			if iface != ClockRealTime && iface != master {
+				ptpStats[iface].SetLastOffset(FreeRunOffsetValue)
+				ptpStats[iface].SetLastSyncState(ptp.FREERUN)
+				aliasValue := alias.GetAlias(string(iface))
+				if ptpStats[iface].Alias() != aliasValue {
+					ptpStats[iface].SetAlias(aliasValue)
+				}
+				// update all ts2phc reported metrics as FREERUN
+				UpdateSyncStateMetrics(processName, aliasValue, ptpStats[iface].LastSyncState())
+				UpdatePTPMetrics(master, processName, aliasValue, FreeRunOffsetValue, float64(ptpStats[iface].MaxAbs()),
+					float64(ptpStats[iface].FrequencyAdjustment()), float64(ptpStats[iface].Delay()))
+			}
+		}
+	} else { // other profiles
+		// T-BC: when ptp4l dies, fire FREERUN for the T-BC aggregate resource.
+		// Without this, the T-BC stats key is never set to FREERUN (DPLL/ts2phc
+		// keep T-BC-STATUS at s2), so ParseTBCLogs never detects a state
+		// transition and the recovery LOCKED event is never published.
+		if profileType == ptp4lconf.TBC && processName == ptp4lProcessName {
+			tbcKey := types.IFace(stats.TBCMainClockName)
+			if tbcStat, ok := ptpStats[tbcKey]; ok && tbcStat.Alias() != "" {
+				masterResource := fmt.Sprintf("%s/%s", tbcStat.Alias(), MasterClockType)
+				p.GenPTPEvent(profileName, tbcStat, masterResource, FreeRunOffsetValue, ptp.FREERUN, ptp.PtpStateChange)
+			}
+		}
+		if masterOffsetSource == processName {
+			if ptpStats[master].Alias() != "" {
+				masterResource := fmt.Sprintf("%s/%s", ptpStats[master].Alias(), MasterClockType)
+				p.GenPTPEvent(profileName, ptpStats[master], masterResource, FreeRunOffsetValue, ptp.FREERUN, ptp.PtpStateChange)
+			}
+		}
+		if s, ok := ptpStats[ClockRealTime]; ok {
+			opts := p.PtpConfigMapUpdates.LookupPtpProcessOpts(profileName)
+			if opts != nil && opts.Phc2SysEnabled() && !opts.ChronydEnabled() {
+				p.GenPTPEvent(profileName, s, ClockRealTime, FreeRunOffsetValue, ptp.FREERUN, ptp.OsClockSyncStateChange)
+				UpdateSyncStateMetrics(phc2sysProcessName, ClockRealTime, ptp.FREERUN)
+			}
+		}
+	}
+}
+
+func (p *PTPEventManager) validLogToProcess(profileName, processName string, iFaceSize int) bool {
+	if profileName == "" {
+		log.Infof("%s config does not have profile name, skipping. ", processName)
+		return false
+	}
+	// phc2sys config for HA will not have any interface defined
+	if iFaceSize == 0 && !p.IsHAProfile(profileName) && processName != chronydProcessName { //TODO: Use PMC to update port and roles
+		log.Errorf("file watcher have not picked the files yet or ptp4l doesn't have config for %s by process %s", profileName, processName)
+		return false
+	}
+	return true
+}
+
+// SetMasterOffsetSource .. setting for testing purposes
+func SetMasterOffsetSource(processName string) {
+	masterOffsetSource = processName
+}
