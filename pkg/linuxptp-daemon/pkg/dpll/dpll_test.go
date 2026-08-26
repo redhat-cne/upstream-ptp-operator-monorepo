@@ -195,7 +195,7 @@ func TestDpllConfig_MonitorProcessGNSS(t *testing.T) {
 			ClockType:       "GM",
 			ConfigName:      "test",
 			EventChannel:    eventChannel,
-			GMThreshold:     config.Threshold{},
+			GMThreshold:     config.Threshold{Max: 100}, // non-zero Max: isOffsetInRange now does abs(offset) < Max (strict)
 			InitialPTPState: event.PTP_FREERUN,
 		})
 	}
@@ -237,7 +237,7 @@ func TestDpllConfig_MonitorProcessPPS(t *testing.T) {
 			ClockType:       "GM",
 			ConfigName:      "test",
 			EventChannel:    eventChannel,
-			GMThreshold:     config.Threshold{},
+			GMThreshold:     config.Threshold{Max: 100}, // non-zero Max: isOffsetInRange now does abs(offset) < Max (strict)
 			InitialPTPState: event.PTP_FREERUN,
 		})
 	}

@@ -188,7 +188,8 @@ func NewProcessManager() *ProcessManager {
 	processPTP.ptpClockThreshold = &ptpv1.PtpClockThreshold{
 		HoldOverTimeout:    5,
 		MaxOffsetThreshold: 100,
-		MinOffsetThreshold: -100,
+		// MinOffsetThreshold is deprecated; offset evaluation only compares
+		// abs(offset) < MaxOffsetThreshold.
 	}
 	return &ProcessManager{
 		process: []*ptpProcess{processPTP},
@@ -951,8 +952,11 @@ func (dn *Daemon) applyNodePTPProfiles() error {
 						ConfigName:   p.configName,
 						EventChannel: dn.processManager.eventChannel,
 						GMThreshold: config.Threshold{
+							// Min is not populated: it is deprecated and no
+							// longer consumed by dependent-process offset
+							// evaluation (dpll/gpsd isOffsetInRange), which
+							// now compare abs(offset) < Max.
 							Max:             p.ptpClockThreshold.MaxOffsetThreshold,
-							Min:             p.ptpClockThreshold.MinOffsetThreshold,
 							HoldOverTimeout: p.ptpClockThreshold.HoldOverTimeout,
 						},
 						InitialPTPState: event.PTP_FREERUN,
@@ -964,7 +968,7 @@ func (dn *Daemon) applyNodePTPProfiles() error {
 					if syncer, ok := d.(initialStateSyncer); ok {
 						syncer.SyncInitialState()
 					}
-					glog.Infof("enabling dep process %s with Max %d Min %d Holdover %d", d.Name(), p.ptpClockThreshold.MaxOffsetThreshold, p.ptpClockThreshold.MinOffsetThreshold, p.ptpClockThreshold.HoldOverTimeout)
+					glog.Infof("enabling dep process %s with Max %d Holdover %d", d.Name(), p.ptpClockThreshold.MaxOffsetThreshold, p.ptpClockThreshold.HoldOverTimeout)
 				}
 			}
 			if p.skipInitialStartup != "" {
@@ -2137,25 +2141,26 @@ func (p *ptpProcess) cmdSetEnabled(enabled bool) {
 	}
 }
 
+// getPTPThreshold resolves the effective PtpClockThreshold for a profile.
+// MinOffsetThreshold is deprecated and is never populated on the returned
+// value (regardless of what the profile explicitly configures): nothing in
+// np-linuxptp-daemon reads it anymore, since offset evaluation only compares
+// abs(offset) < MaxOffsetThreshold.
 func getPTPThreshold(nodeProfile *ptpv1.PtpProfile) *ptpv1.PtpClockThreshold {
 	if nodeProfile.PtpClockThreshold != nil {
 		return &ptpv1.PtpClockThreshold{
 			HoldOverTimeout:    nodeProfile.PtpClockThreshold.HoldOverTimeout,
 			MaxOffsetThreshold: nodeProfile.PtpClockThreshold.MaxOffsetThreshold,
-			MinOffsetThreshold: nodeProfile.PtpClockThreshold.MinOffsetThreshold,
 		}
-	}
-	if isNtpFailoverEnabled(nodeProfile) {
+	} else if isNtpFailoverEnabled(nodeProfile) {
 		return &ptpv1.PtpClockThreshold{
 			HoldOverTimeout:    5,
 			MaxOffsetThreshold: 1000,
-			MinOffsetThreshold: -1000,
 		}
 	}
 	return &ptpv1.PtpClockThreshold{
 		HoldOverTimeout:    5,
 		MaxOffsetThreshold: 100,
-		MinOffsetThreshold: -100,
 	}
 }
 
