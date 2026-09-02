@@ -62,6 +62,7 @@ rules:
   resources:
   - nodeptpdevices
   verbs:
+  - create
   - get
   - list
   - watch
