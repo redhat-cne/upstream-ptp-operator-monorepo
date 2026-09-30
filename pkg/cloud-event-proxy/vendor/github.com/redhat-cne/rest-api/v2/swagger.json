@@ -1,0 +1,377 @@
+{
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "schemes": [
+    "http",
+    "https"
+  ],
+  "swagger": "2.0",
+  "info": {
+    "description": "REST API Spec.",
+    "title": "O-RAN Compliant REST API",
+    "version": "2.0.0"
+  },
+  "host": "localhost:9043",
+  "basePath": "/api/ocloudNotifications/v2",
+  "paths": {
+    "/health": {
+      "get": {
+        "description": "Returns the health status for the ocloudNotifications REST API.",
+        "tags": [
+          "HealthCheck"
+        ],
+        "summary": "(Extensions to O-RAN API) Returns the health status of API.",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "$ref": "#/responses/statusOK"
+          }
+        }
+      }
+    },
+    "/publishers": {
+      "get": {
+        "description": "Returns a list of publisher details for the cluster node.",
+        "tags": [
+          "Publishers"
+        ],
+        "summary": "(Extensions to O-RAN API) Get publishers.",
+        "operationId": "getPublishers",
+        "responses": {
+          "200": {
+            "$ref": "#/responses/publishers"
+          },
+          "404": {
+            "description": "Publishers not found"
+          }
+        }
+      }
+    },
+    "/subscriptions": {
+      "get": {
+        "description": "Get a list of subscription object(s) and their associated properties.",
+        "tags": [
+          "Subscriptions"
+        ],
+        "summary": "Retrieves a list of subscriptions.",
+        "operationId": "getSubscriptions",
+        "responses": {
+          "200": {
+            "$ref": "#/responses/subscriptions"
+          },
+          "400": {
+            "description": "Bad request by the client."
+          }
+        }
+      },
+      "post": {
+        "description": "Creates a new subscription for the required event by passing the appropriate payload.",
+        "tags": [
+          "Subscriptions"
+        ],
+        "summary": "Creates a subscription resource for the Event Consumer.",
+        "operationId": "createSubscription",
+        "parameters": [
+          {
+            "description": "The payload will include an event notification request, endpointUri and ResourceAddress. The SubscriptionId and UriLocation are ignored in the POST body (these will be sent to the client after the resource is created).",
+            "name": "SubscriptionInfo",
+            "in": "body",
+            "schema": {
+              "$ref": "#/definitions/SubscriptionInfo"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "$ref": "#/responses/pubSubResp"
+          },
+          "400": {
+            "description": "Bad request. For example, the endpoint URI is not correctly formatted."
+          },
+          "404": {
+            "description": "Not Found. Subscription resource is not available."
+          },
+          "409": {
+            "description": "Conflict. The subscription resource already exists."
+          }
+        }
+      },
+      "delete": {
+        "description": "Delete all subscriptions.",
+        "tags": [
+          "Subscriptions"
+        ],
+        "summary": "(Extensions to O-RAN API) Delete all subscriptions.",
+        "operationId": "deleteAllSubscriptions",
+        "responses": {
+          "204": {
+            "description": "Deleted all subscriptions."
+          }
+        }
+      }
+    },
+    "/subscriptions/{subscriptionId}": {
+      "get": {
+        "description": "Returns details for the subscription with ID subscriptionId.",
+        "tags": [
+          "Subscriptions"
+        ],
+        "summary": "Returns details for a specific subscription.",
+        "operationId": "getSubscriptionByID",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "ID",
+            "description": "Identifier for subscription resource, created after a successful subscription.",
+            "name": "subscriptionId",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/responses/subscription"
+          },
+          "404": {
+            "description": "Not Found. Subscription resources are not available (not created)."
+          }
+        }
+      },
+      "delete": {
+        "description": "Deletes an individual subscription resource object and its associated properties.",
+        "tags": [
+          "Subscriptions"
+        ],
+        "summary": "Delete a specific subscription.",
+        "operationId": "deleteSubscription",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "ID",
+            "description": "Identifier for subscription resource, created after a successful subscription.",
+            "name": "subscriptionId",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success."
+          },
+          "404": {
+            "description": "Not Found. Subscription resources are not available (not created)."
+          }
+        }
+      }
+    },
+    "/{ResourceAddress}/CurrentState": {
+      "get": {
+        "description": "As a result of successful execution of this method the Event Consumer will receive the current event status notifications of the node that the Event Consumer resides on.",
+        "tags": [
+          "Events"
+        ],
+        "summary": "Pulls the event status notifications for specified ResourceAddress.",
+        "operationId": "getCurrentState",
+        "parameters": [
+          {
+            "type": "string",
+            "x-go-name": "Resource",
+            "description": "Identifier for subscription resource",
+            "name": "ResourceAddress",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/responses/eventResp"
+          },
+          "404": {
+            "description": "Not Found. Event notification resource is not available on this node."
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "Data": {
+      "description": "Array of JSON objects defining the information for the event.\n\nExample:\n```go\n\n{\n\"version\": \"v1.0\",\n\"values\": [{\n\"ResourceAddress\": \"/sync/sync-status/sync-state\",\n\"data_type\": \"notification\",\n\"value_type\": \"enumeration\",\n\"value\": \"ACQUIRING-SYNC\"\n}, {\n\"ResourceAddress\": \"/sync/sync-status/sync-state\",\n\"data_type\": \"metric\",\n\"value_type\": \"decimal64.3\",\n\"value\": 100.3\n}\n}]\n}\n\n```",
+      "type": "object",
+      "title": "Data",
+      "properties": {
+        "values": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DataValue"
+          },
+          "x-go-name": "Values"
+        },
+        "version": {
+          "type": "string",
+          "x-go-name": "Version",
+          "example": "1.0"
+        }
+      },
+      "x-go-package": "github.com/redhat-cne/sdk-go/pkg/event"
+    },
+    "DataValue": {
+      "description": "A json array of values defining the event.\n\nExample:\n```go\n\n{\n\"ResourceAddress\": \"/cluster/node/ptp\",\n\"data_type\": \"notification\",\n\"value_type\": \"enumeration\",\n\"value\": \"ACQUIRING-SYNC\"\n}\n\n```",
+      "type": "object",
+      "title": "DataValue",
+      "properties": {
+        "ResourceAddress": {
+          "description": "The resource address specifies the Event Producer with a hierarchical path. Currently hierarchical paths with wild cards are not supported.",
+          "type": "string",
+          "x-go-name": "Resource",
+          "example": "/east-edge-10/Node3/sync/sync-status/sync-state"
+        },
+        "data_type": {
+          "description": "Type of value object. ( notification | metric)",
+          "type": "string",
+          "x-go-name": "DataType",
+          "example": "notification"
+        },
+        "value": {
+          "description": "value in value_type format.",
+          "x-go-name": "Value",
+          "example": "HOLDOVER"
+        },
+        "value_type": {
+          "description": "The type format of the value property.",
+          "type": "string",
+          "x-go-name": "ValueType",
+          "example": "enumeration"
+        }
+      },
+      "x-go-package": "github.com/redhat-cne/sdk-go/pkg/event"
+    },
+    "EventData": {
+      "description": "Event Data Model specifies the event Status Notification data model supported by the API. The current model supports JSON encoding of the CloudEvents.io specification for the event payload.",
+      "type": "object",
+      "title": "Event Data Model",
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/Data"
+        },
+        "id": {
+          "description": "Identifies the event. The Event Producer SHALL ensure that source + id is unique for each distinct event",
+          "type": "string",
+          "x-go-name": "ID",
+          "example": "e0dcb68b-2541-4d21-ab73-a222e42373c2"
+        },
+        "source": {
+          "description": "Identifies the context in which an event happened.",
+          "type": "string",
+          "x-go-name": "Source",
+          "example": "/sync/sync-status/sync-state"
+        },
+        "specversion": {
+          "description": "The version of the CloudEvents specification which the event uses. This enables the interpretation of the context.",
+          "type": "string",
+          "x-go-name": "SpecVersion",
+          "example": "1.0"
+        },
+        "time": {
+          "description": "Time at which the event occurred.",
+          "type": "string",
+          "x-go-name": "Time",
+          "example": "2021-03-05T20:59:00.999999999Z"
+        },
+        "type": {
+          "description": "This attribute contains a value describing the type of event related to the originating occurrence.",
+          "type": "string",
+          "x-go-name": "Type",
+          "example": "event.sync.sync-status.synchronization-state-change"
+        }
+      },
+      "x-go-package": "github.com/redhat-cne/rest-api/v2"
+    },
+    "SubscriptionInfo": {
+      "description": "SubscriptionInfo defines data types used for subscription.",
+      "type": "object",
+      "title": "SubscriptionInfo",
+      "properties": {
+        "EndpointUri": {
+          "description": "Endpoint URI (a.k.a callback URI), e.g. http://localhost:8080/resourcestatus/ptp",
+          "type": "string",
+          "x-go-name": "EndPointURI",
+          "example": "http://event-receiver/endpoint"
+        },
+        "ResourceAddress": {
+          "description": "The resource address specifies the Event Producer with a hierarchical path.\nFormat /{clusterName}/{siteName}(/optional/hierarchy/..)/{nodeName}/{(/optional/hierarchy)/resource}",
+          "type": "string",
+          "x-go-name": "Resource",
+          "example": "/east-edge-10/vdu3/o-ran-sync/sync-group/sync-status/sync-state"
+        },
+        "SubscriptionId": {
+          "description": "Identifier for the created subscription resource.",
+          "type": "string",
+          "x-go-name": "ID",
+          "example": "d1dd1770-e718-401e-ba32-cef05a286164"
+        },
+        "UriLocation": {
+          "description": "The URI location for querying the subscription created.",
+          "type": "string",
+          "x-go-name": "URILocation",
+          "example": "http://localhost:9043/api/ocloudNotifications/v2/publishers/d1dd1770-e718-401e-ba32-cef05a286164"
+        }
+      },
+      "x-go-package": "github.com/redhat-cne/rest-api/v2"
+    }
+  },
+  "responses": {
+    "eventResp": {
+      "description": "Return the pull event status",
+      "schema": {
+        "$ref": "#/definitions/EventData"
+      }
+    },
+    "pubSubResp": {
+      "description": "Shall be returned when the subscription resource is created successfully.",
+      "schema": {
+        "$ref": "#/definitions/SubscriptionInfo"
+      }
+    },
+    "publishers": {
+      "description": "",
+      "schema": {
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/SubscriptionInfo"
+        }
+      }
+    },
+    "statusOK": {
+      "description": "OK"
+    },
+    "subscription": {
+      "description": "Returns the subscription resource object and its associated properties.",
+      "schema": {
+        "$ref": "#/definitions/SubscriptionInfo"
+      }
+    },
+    "subscriptions": {
+      "description": "Returns the subscription resources and their associated properties that already exist.",
+      "schema": {
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/SubscriptionInfo"
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "description": "Manage Subscriptions",
+      "name": "Subscriptions"
+    },
+    {
+      "description": "Event Pull Status Notification",
+      "name": "Events"
+    }
+  ]
+}
