@@ -4,6 +4,11 @@ run:
   issues-exit-code: 1
   tests: true
 issues:
+  exclude-rules:
+    - linters:
+        - revive
+      text: dot-imports
+      path: _test\.go
   new-from-rev: 40b7193bca87852ab9db658680d70bf2a96d10f6
 linters:
   settings:
