@@ -537,56 +537,14 @@ The following diagram shows an example of configuration that can be created in t
 ![example](doc/ptp-ci-aws-dnbc-example.svg)
 
 ## Scripts documentation
-- `configpair.sh`: creates a 2 netdevsim interfaces and connected via a virtual link
-```
-  ./configpair.sh < port1 netdevsim ID (unique)> <port 2 netdevsim ID (unique)> <name of the interface on both side of the link (ptp1)>
-# <port1 ptp clock ID A (/dev/ptpA)> < port2 ptp clock ID B (/dev/ptpB)> <port1 container name > <port2 container name> <port1 pci ID> <port2 pci ID>
-```
-- `deploy-prometheus.sh`: Deploys prometheus
-- `kind-config.yaml`: reference kind cluster configuration
-- `reset-devices.sh`: loads netdevsim and openvswitch kernel drivers
-- `run-on-vm.sh`: top level script called by the github action to run CI tests.  Can also be used on local VM with netdevsim to run tests locally.
-- `run-tests.sh`: Configurable PTP conformance test runner. Supports serial, parallel, or both execution kinds, selectable test modes, and optional linuxptp-daemon image for pmc pod tests.
-```
-./run-tests.sh --kind <serial|parallel|both> --mode <modes> [--loglevel <level>] [--linuxptp-daemon-image <url>]
-```
-- `configSwitch2.sh`: configures virtual Ethernet switch (openvswitch) container
-- `create-vrt-clocks.sh`: per-node stand-in mock PHCs for virtual CLOCK_REALTIME (DKMS CI)
-- `ptp-vrt/`: phc2sys LD_PRELOAD shim + wrapper (baked into linuxptp-daemon image)
-- `fix-certs.sh`: Fix certificates for the linuxptp-daemon in Kind
-- `install-tools.sh`: install tools such as ginkgo, go, ...
-- `prepare-kind.sh`: basic configuration to make the kind clusted look like a openshift cluster
-- `retry.sh`: retry command
-```
-./retry.sh <timeout> <interval> <command>
-```
-- `create-local-registry.sh`: creare local docker registry
-- `k8s-start.sh`: starts the kind cluster
-- `ptpswitchconfig.cfg`: ptp4l configuration for the Openvswitch switch1
 
-## ptp-tools
-The ptp-tools list a set set a make targets to build all images required to run the ptp-operator
+Kind/netdevsim helpers (`run-on-vm.sh`, `ptp-tools/`, Kind cluster scripts) live in
+[redhat-cne/ptp-netdevsim-ci](https://github.com/redhat-cne/ptp-netdevsim-ci).
+GitHub Actions calls that repo from `.github/workflows/ptp-operator-netdevsim-ci.yaml`.
 
-To build all images (ptp-operator, linuxptp-daemon, kube-rbac-proxy, cloud-event-proxy) in a single personal repository. First create a repository in quay.io or another registry the same repository will be used to store all various debug images. The tag part of the image url indicates the image type.
-
-
-The command uses a single quay.io repository ans stores the different images as tags:
-- `cep` tag: cloud-event-proxy
-- `ptpop` tag: ptp-operator
-- `lptpd` tag: linuxptp-daemon
-- `krp` tag: kube-rbac-proxy
-
+To overlay those scripts locally onto this checkout:
 
 ```
-IMG_PREFIX=quay.io/<user>/<repo> make podman-buildall
-```
-
-To push all images:
-```
-IMG_PREFIX=quay.io/<user>/<repo> make podman-pushall
-```
-
-To deploy all containers including cloud-event-proxy sidecar:
-```
-IMG_PREFIX=quay.io/<user>/<repo> make deployall
+./scripts/fetch-upstream-ci.sh https://github.com/redhat-cne/upstream-ptp-operator-monorepo.git
+./scripts/run-ci-local.sh <VM_IP>
 ```

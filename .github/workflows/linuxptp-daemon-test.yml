@@ -1,0 +1,13 @@
+name: "linuxptp-daemon: Test"
+on:
+  push:
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+  pull_request:
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+
+jobs:
+  test:
+    uses: redhat-cne/upstream-ptp-operator-monorepo/.github/workflows/_reusable-linuxptp-daemon-test.yml@main
+    secrets: inherit
