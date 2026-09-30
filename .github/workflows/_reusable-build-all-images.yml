@@ -1,0 +1,320 @@
+name: "Reusable: Build All Images and Catalog"
+
+on:
+  workflow_call:
+    inputs:
+      branches:
+        description: 'JSON array of branches to build (e.g. ["release-4.18","main"])'
+        required: false
+        type: string
+        default: '["main"]'
+      repository:
+        description: 'Repository to check out branches from (e.g. owner/repo for cross-repo builds)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-images:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(inputs.branches) }}
+    outputs:
+      versions: ${{ steps.collect-versions.outputs.versions }}
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ matrix.branch }}
+
+      - name: Detect versions and paths
+        id: detect
+        run: |
+          BRANCH="${{ matrix.branch }}"
+          if [ "$BRANCH" = "main" ]; then
+            VERSION="latest"
+          else
+            VERSION=$(echo "$BRANCH" | sed 's/release-//')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          GO_VER=$(awk '/^go /{print $2}' go.mod pkg/*/go.mod 2>/dev/null | sort -V | tail -1)
+          echo "go_version=$GO_VER" >> "$GITHUB_OUTPUT"
+
+          OPERATOR_MODULE=$(awk '/^module /{print $2; exit}' go.mod)
+          echo "operator_workdir=/go/src/$OPERATOR_MODULE" >> "$GITHUB_OUTPUT"
+
+          if [ -f pkg/linuxptp-daemon/go.mod ]; then
+            DAEMON_MODULE=$(awk '/^module /{print $2; exit}' pkg/linuxptp-daemon/go.mod)
+            echo "daemon_workdir=/go/src/$DAEMON_MODULE" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -f pkg/cloud-event-proxy/go.mod ]; then
+            CEP_MODULE=$(awk '/^module /{print $2; exit}' pkg/cloud-event-proxy/go.mod)
+            echo "cep_workdir=/go/src/$CEP_MODULE" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Branch=$BRANCH version=$VERSION go=$GO_VER"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.detect.outputs.go_version }}
+          cache: false
+
+      - name: Install operator-sdk
+        run: |
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          [ "$ARCH" = "x86_64" ] && ARCH="amd64"
+          SDK_VER=$(grep -E '^OPERATOR_SDK_VERSION \?=' Makefile | head -1 | sed 's/.*?= *//')
+          [ -z "$SDK_VER" ] && SDK_VER=$(grep 'OPERATOR_SDK_VERSION_REQ' Makefile | head -1 | sed 's/.*= *//')
+          [ -z "$SDK_VER" ] && SDK_VER="v1.36.1-ocp"
+          echo "Installing operator-sdk $SDK_VER"
+          curl -sfLo operator-sdk "https://mirror.openshift.com/pub/openshift-v4/${ARCH}/clients/operator-sdk/${SDK_VER}/operator-sdk-${OS}-${ARCH}" \
+            || curl -sfLo operator-sdk "https://github.com/operator-framework/operator-sdk/releases/download/${SDK_VER}/operator-sdk_${OS}_${ARCH}" \
+            || { echo "::error::operator-sdk $SDK_VER download failed from both mirrors"; exit 1; }
+          chmod +x operator-sdk
+          sudo mv operator-sdk /usr/local/bin/
+          echo "operator-sdk installed: $(operator-sdk version)"
+
+      - name: Generate and build bundle
+        id: bundle
+        run: |
+          set -e
+          VERSION="${{ steps.detect.outputs.version }}"
+          REPO="${{ github.repository }}"
+
+          export IMG="${{ env.REGISTRY }}/${REPO}/ptp-operator:${VERSION}"
+          export IMAGE_TAG_BASE="${{ env.REGISTRY }}/${REPO}/ptp-operator"
+          export VERSION="${VERSION}"
+          export BUNDLE_IMG="${{ env.REGISTRY }}/${REPO}/ptp-operator-bundle:${VERSION}"
+
+          echo "=== Environment ==="
+          echo "IMG=$IMG"
+          echo "IMAGE_TAG_BASE=$IMAGE_TAG_BASE"
+          echo "VERSION=$VERSION"
+          echo "BUNDLE_IMG=$BUNDLE_IMG"
+          echo "=== Running make bundle ==="
+          make bundle
+          echo "Bundle generated successfully"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push bundle image
+        run: |
+          set -e
+          VERSION="${{ steps.detect.outputs.version }}"
+          REPO="${{ github.repository }}"
+          BUNDLE_IMG="${{ env.REGISTRY }}/${REPO}/ptp-operator-bundle:${VERSION}"
+          echo "Building bundle image: ${BUNDLE_IMG}"
+          docker build -f bundle.Dockerfile -t "${BUNDLE_IMG}" .
+          docker push "${BUNDLE_IMG}"
+          echo "Bundle pushed: ${BUNDLE_IMG}"
+
+      - name: Patch Dockerfiles for public images
+        run: |
+          GO_VER="${{ steps.detect.outputs.go_version }}"
+
+          patch_dockerfile() {
+            local df="$1"
+            [ -f "$df" ] || return 0
+
+            sed -i -E "s|FROM (--platform=[^ ]+ )?registry\.ci\.openshift\.org/ocp/builder:rhel-[89]-golang-[0-9.]+-openshift-[0-9.]+ |FROM \1docker.io/golang:${GO_VER} |g" "$df"
+            sed -i -E "s|FROM (--platform=[^ ]+ )?registry\.access\.redhat\.com/ubi9/go-toolset:[0-9.]+ |FROM \1docker.io/golang:${GO_VER} |g" "$df"
+            sed -i -E "s|FROM (--platform=[^ ]+ )?openshift/origin-release:golang-[0-9.]+ |FROM \1docker.io/golang:${GO_VER} |g" "$df"
+
+            sed -i -E 's|FROM (--platform=[^ ]+ )?registry\.ci\.openshift\.org/ocp/[0-9.]+:base-rhel9[^ ]*|FROM \1quay.io/centos/centos:stream9|g' "$df"
+            sed -i -E 's|FROM (--platform=[^ ]+ )?registry\.ci\.openshift\.org/ocp/[0-9.]+:base\b[^ ]*|FROM \1quay.io/centos/centos:stream9|g' "$df"
+            sed -i -E 's|FROM (--platform=[^ ]+ )?quay\.io/openshift/origin-base:[0-9.]+[^ ]*|FROM \1quay.io/centos/centos:stream9|g'  "$df"
+            sed -i -E 's|FROM (--platform=[^ ]+ )?openshift/origin-base [^ ]*|FROM \1quay.io/centos/centos:stream9|g' "$df"
+
+            sed -i -E "s|FROM (--platform=[^ ]+ )?registry\.access\.redhat\.com/ubi9/go-toolset:[^ ]+ AS builder|FROM \1docker.io/golang:${GO_VER} AS builder|g" "$df"
+
+            sed -i '/^USER root$/d' "$df"
+
+            echo "Patched: $df"
+            grep '^FROM' "$df"
+          }
+
+          patch_dockerfile Dockerfile
+          patch_dockerfile pkg/linuxptp-daemon/Dockerfile
+          patch_dockerfile pkg/cloud-event-proxy/Dockerfile
+
+      - name: Strip local replace directives for isolated Docker builds
+        run: |
+          for gomod in pkg/*/go.mod; do
+            [ -f "$gomod" ] || continue
+            pkg_dir=$(dirname "$gomod")
+            vmt="$pkg_dir/vendor/modules.txt"
+
+            for mod in $(grep '=> \.\./' "$gomod" 2>/dev/null | awk '{print $2}'); do
+              echo "Stripping replace for $mod from $gomod"
+              sed -i "\|^replace ${mod} |d" "$gomod"
+              sed -i "\|^replace ${mod}$|d" "$gomod"
+              if [ -f "$vmt" ]; then
+                echo "  Also stripping $mod replace markers from vendor/modules.txt"
+                sed -i "s|^\(# ${mod} [^ ]*\) =>.*|\1|" "$vmt"
+                sed -i "\|^# ${mod} =>|d" "$vmt"
+              fi
+            done
+          done
+
+      - name: Patch Go version in plain Dockerfiles
+        run: |
+          GO_VER="${{ steps.detect.outputs.go_version }}"
+          for df in Dockerfile pkg/*/Dockerfile; do
+            [ -f "$df" ] || continue
+            sed -i -E "s|FROM golang:[0-9.]+ |FROM docker.io/golang:${GO_VER} |g" "$df"
+          done
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ptp-operator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/ptp-operator:${{ steps.detect.outputs.version }}
+          provenance: false
+
+      - name: Build and push linuxptp-daemon image
+        if: hashFiles('pkg/linuxptp-daemon/Dockerfile') != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: pkg/linuxptp-daemon
+          file: pkg/linuxptp-daemon/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/linuxptp-daemon:${{ steps.detect.outputs.version }}
+          provenance: false
+
+      - name: Build and push cloud-event-proxy image
+        if: hashFiles('pkg/cloud-event-proxy/Dockerfile') != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: pkg/cloud-event-proxy
+          file: pkg/cloud-event-proxy/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/cloud-event-proxy:${{ steps.detect.outputs.version }}
+          provenance: false
+
+      - name: Record version
+        id: collect-versions
+        run: |
+          echo "versions=${{ steps.detect.outputs.version }}" >> "$GITHUB_OUTPUT"
+
+  build-catalog:
+    runs-on: ubuntu-latest
+    needs: build-images
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: main
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install opm
+        run: |
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          [ "$ARCH" = "x86_64" ] && ARCH="amd64"
+          OPM_VER=$(grep -E 'operator-registry/releases' Makefile | grep -o 'v[0-9.]*' | head -1)
+          [ -z "$OPM_VER" ] && OPM_VER="v1.60.0"
+          echo "Installing opm $OPM_VER"
+          curl -sLo opm "https://github.com/operator-framework/operator-registry/releases/download/${OPM_VER}/${OS}-${ARCH}-opm"
+          chmod +x opm
+          sudo mv opm /usr/local/bin/
+
+      - name: Build catalog index
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+          REGISTRY="${{ env.REGISTRY }}"
+
+          mkdir -p catalog
+          FAILED_BUNDLES=""
+          RENDERED=0
+
+          BRANCHES='${{ inputs.branches }}'
+          for BRANCH in $(echo "$BRANCHES" | jq -r '.[]'); do
+            if [ "$BRANCH" = "main" ]; then
+              VER="latest"
+            else
+              VER=$(echo "$BRANCH" | sed 's/release-//')
+            fi
+            BUNDLE_IMG="${REGISTRY}/${REPO}/ptp-operator-bundle:${VER}"
+
+            echo "--- Pulling bundle: $BUNDLE_IMG ---"
+            if ! docker pull "$BUNDLE_IMG"; then
+              echo "::error::Bundle image not found: $BUNDLE_IMG"
+              FAILED_BUNDLES="$FAILED_BUNDLES $VER"
+              continue
+            fi
+            echo "Rendering bundle: $BUNDLE_IMG"
+            opm render "$BUNDLE_IMG" >> catalog/index.yaml
+            RENDERED=$((RENDERED + 1))
+          done
+
+          if [ -n "$FAILED_BUNDLES" ]; then
+            echo "::error::Failed to pull bundles for:$FAILED_BUNDLES"
+          fi
+
+          if [ "$RENDERED" -eq 0 ]; then
+            echo "::error::No bundles were rendered, cannot build catalog"
+            exit 1
+          fi
+
+          echo "=== Rendered $RENDERED bundles ==="
+
+          PACKAGE_NAME="ptp-operator"
+          CHANNEL_NAME="alpha"
+          {
+            echo "---"
+            echo "schema: olm.channel"
+            echo "package: ${PACKAGE_NAME}"
+            echo "name: ${CHANNEL_NAME}"
+            echo "entries:"
+            grep '^  name:' catalog/index.yaml | awk '{print $2}' | sort -V | while read -r bname; do
+              echo "  - name: ${bname}"
+            done
+          } >> catalog/index.yaml
+
+          echo "=== Validating catalog ==="
+          opm validate catalog/
+
+          cat > catalog.Dockerfile <<'CATEOF'
+          FROM registry.access.redhat.com/ubi9/ubi-micro:latest
+          COPY catalog/ /configs/
+          LABEL operators.operatorframework.io.index.configs.v1=/configs/
+          CATEOF
+
+          docker build -t "${REGISTRY}/${REPO}/ptp-operator-catalog:latest" -f catalog.Dockerfile .
+          docker push "${REGISTRY}/${REPO}/ptp-operator-catalog:latest"
+          echo "Catalog pushed: ${REGISTRY}/${REPO}/ptp-operator-catalog:latest"
