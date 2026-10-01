@@ -6,7 +6,7 @@ jobs:
   test:
     strategy:
       matrix:
-        1[1.25.0]  # Use valid versions
+        go-version: [1.25.0]  # Use valid versions
         os: [ubuntu-latest]
 
     runs-on: ${{ matrix.os }}
