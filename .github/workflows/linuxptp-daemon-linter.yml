@@ -28,7 +28,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
         with:
-          working-directory: pkg/linuxptp-daemon
           fetch-depth: 0
 
       - name: Set up Go
@@ -39,4 +38,5 @@ jobs:
       - name: lint test
         uses: golangci/golangci-lint-action@v9
         with:
+          working-directory: pkg/linuxptp-daemon
           version: v2.12
