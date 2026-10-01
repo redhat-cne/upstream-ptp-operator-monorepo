@@ -1,0 +1,15 @@
+name: "linuxptp-daemon: PR Update"
+on: pull_request
+
+jobs:
+  execute:
+    name: "remove the lgtm label"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pkg/linuxptp-daemon
+    steps:
+      - uses: jpmcb/prow-github-actions@v1.1.2
+        with:
+          jobs: 'lgtm'
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
