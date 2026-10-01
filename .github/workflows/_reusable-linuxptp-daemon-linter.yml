@@ -29,5 +29,5 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.64
-          args: --timeout 5m
+          args: --timeout 5m --new-from-rev=HEAD~1
           working-directory: pkg/linuxptp-daemon

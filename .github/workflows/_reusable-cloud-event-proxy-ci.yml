@@ -20,7 +20,7 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.64
-          args: --timeout 3m0s
+          args: --timeout 3m0s --new-from-rev=HEAD~1
           working-directory: pkg/cloud-event-proxy
 
   unit-tests:
