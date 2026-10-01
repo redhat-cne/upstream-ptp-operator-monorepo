@@ -1,6 +1,13 @@
 ---
 name: "cloud-event-proxy: CI"
-on: [push, pull_request]
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - 'release-*'
+
 jobs:
   golangci:
     name: Linting
@@ -10,6 +17,8 @@ jobs:
         working-directory: pkg/cloud-event-proxy
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: 1.23
