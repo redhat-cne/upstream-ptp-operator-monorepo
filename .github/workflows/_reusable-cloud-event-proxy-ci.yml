@@ -20,6 +20,7 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.64
+          install-mode: "goinstall"
           args: --timeout 3m0s
           only-new-issues: true
           working-directory: pkg/cloud-event-proxy

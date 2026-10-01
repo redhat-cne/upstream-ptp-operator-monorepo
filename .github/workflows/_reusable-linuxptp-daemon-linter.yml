@@ -29,6 +29,7 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.64
+          install-mode: "goinstall"
           args: --timeout 5m
           only-new-issues: true
           working-directory: pkg/linuxptp-daemon
