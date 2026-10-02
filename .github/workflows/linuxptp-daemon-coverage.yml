@@ -1,0 +1,31 @@
+name: "linuxptp-daemon: Coverage"
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  coverage:
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-coverage')"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pkg/linuxptp-daemon
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Coverage Gate
+        if: github.event_name == 'pull_request'
+        run: make coverage-gate BASE_REF=${{ github.event.pull_request.base.sha }}
+
+      - name: Generate Coverage
+        if: github.event_name == 'push'
+        run: make test
