@@ -18,13 +18,31 @@
 #   --components LIST      Comma-separated list of components: ptpop,lptpd,cep (default: auto-detect)
 #   --fork-owner OWNER     Bot or user fork owner on GitHub (default: $SYNC_BOT_FORK_OWNER or ptp-monorepo-sync-bot)
 #   --monorepo-repo REPO   Monorepo GitHub repository (default: redhat-cne/downstream-ptp-operator-monorepo)
+#   --jira KEYS            Comma-separated Jira keys (e.g. OCPBUGS-123). Default: auto-detect from
+#                          monorepo PR title / commit subject / linked monorepo PR. Reused on every standalone PR.
+#   --monorepo-pr N        Monorepo PR number (stable topic branch sync/monorepo-<branch>-pr-N;
+#                          required for Jira-safe open-before-merge bridging).
+#   --pr-title TEXT        Monorepo PR title (preferred source for OCPBUGS + subject).
 #   --dry-run              Generate patches and format PR without pushing or opening PRs
 #   -h, --help             Show this help message
+#
+# OpenShift / Jira conventions:
+#   - Titles follow openshift-cherrypick-robot style (no "[Monorepo Sync]" prefix):
+#       main / master:  OCPBUGS-N: <subject>
+#       release-X.Y:    [release-X.Y] OCPBUGS-N: <subject>
+#   - Provenance uses label monorepo-sync + Monorepo-Commit trailer (not a title prefix).
+#   - One Jira key from the monorepo PR is reused on all component PRs for that branch.
+#     Backports use the per-release clone key already on the monorepo backport PR/commit.
+#   - Does NOT apply cherry-pick-approved / backport-risk-assessed (humans / QE).
+#   - CI must open/update standalone PRs on monorepo pull_request (not push-after-merge) so
+#     jira-lifecycle-plugin links all PRs before any merge; OCPBUGS → MODIFIED only when all merge.
 #
 # Examples:
 #   ./scripts/create-standalone-backport-pr.sh --branch release-4.22 --commit HEAD
 #   ./scripts/create-standalone-backport-pr.sh --branch release-4.21 --range origin/release-4.21..HEAD
 #   ./scripts/create-standalone-backport-pr.sh --branch release-4.22 --components lptpd,cep --dry-run
+#   ./scripts/create-standalone-backport-pr.sh --branch main --commit HEAD --jira OCPBUGS-12345
+#   ./scripts/create-standalone-backport-pr.sh --branch main --range BASE..HEAD --monorepo-pr 42 --pr-title "OCPBUGS-1: fix"
 #
 
 set -euo pipefail
@@ -38,10 +56,15 @@ COMMIT_RANGE=""
 COMPONENTS_RAW=""
 FORK_OWNER="${SYNC_BOT_FORK_OWNER:-ptp-monorepo-sync-bot}"
 MONOREPO_REPO="${MONOREPO_REPO:-redhat-cne/downstream-ptp-operator-monorepo}"
+JIRA_KEYS_RAW=""
+MONOREPO_PR=""
+PR_TITLE_INPUT=""
 DRY_RUN=false
+# Provenance label applied to outbound PRs (title stays OpenShift/Jira compliant).
+PROVENANCE_LABEL="${SYNC_PROVENANCE_LABEL:-monorepo-sync}"
 
 usage() {
-    sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,45p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -85,6 +108,21 @@ while [ $# -gt 0 ]; do
             MONOREPO_REPO="$2"
             shift 2
             ;;
+        --jira)
+            [ $# -ge 2 ] || die "--jira requires an argument"
+            JIRA_KEYS_RAW="$2"
+            shift 2
+            ;;
+        --monorepo-pr)
+            [ $# -ge 2 ] || die "--monorepo-pr requires an argument"
+            MONOREPO_PR="$2"
+            shift 2
+            ;;
+        --pr-title)
+            [ $# -ge 2 ] || die "--pr-title requires an argument"
+            PR_TITLE_INPUT="$2"
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -106,6 +144,123 @@ if [ "$DRY_RUN" = false ]; then
     need_cmd gh
 fi
 
+# Extract OCPBUGS-### (and comma-separated lists) from free text, unique, stable order.
+extract_jira_keys() {
+    local text="$1"
+    # Portable unique CSV (macOS BSD paste differs from GNU paste -sd,)
+    echo "$text" | grep -oE 'OCPBUGS-[0-9]+' | awk '!seen[$0]++' | awk 'BEGIN{ORS=""} {print (NR>1?",":"") $0}'
+    echo
+}
+
+# Strip OpenShift / bridge prefixes and leading Jira keys → bare subject.
+normalize_commit_subject() {
+    local subject="$1"
+    # Repeatedly strip known prefixes
+    while true; do
+        local next="$subject"
+        next="$(echo "$next" | sed -E 's/^\[Monorepo Sync\][[:space:]]*//I')"
+        next="$(echo "$next" | sed -E 's/^\[release-[0-9]+\.[0-9]+\][[:space:]]*//')"
+        next="$(echo "$next" | sed -E 's/^OCPBUGS-[0-9]+([[:space:]]*,[[:space:]]*OCPBUGS-[0-9]+)*:[[:space:]]*//')"
+        if [ "$next" = "$subject" ]; then
+            break
+        fi
+        subject="$next"
+    done
+    echo "$subject" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'
+}
+
+# Build openshift-bot-compliant PR title. Reuses the same Jira key(s) on every component PR.
+build_openshift_pr_title() {
+    local branch="$1"
+    local subject="$2"
+    local jira_csv="$3"
+    local title=""
+
+    if [ -n "$jira_csv" ]; then
+        # Prefer "OCPBUGS-1, OCPBUGS-2: subject" (space after comma matches common OpenShift style)
+        local jira_fmt
+        jira_fmt="$(echo "$jira_csv" | sed 's/,/, /g')"
+        title="${jira_fmt}: ${subject}"
+    else
+        title="$subject"
+    fi
+
+    case "$branch" in
+        release-*)
+            title="[${branch}] ${title}"
+            ;;
+    esac
+    echo "$title"
+}
+
+# Resolve Jira keys: --jira wins, else --pr-title, else commit subject, else linked monorepo PR title.
+resolve_jira_keys() {
+    local keys=""
+    if [ -n "$JIRA_KEYS_RAW" ]; then
+        keys="$(extract_jira_keys "$JIRA_KEYS_RAW")"
+        [ -n "$keys" ] || die "--jira value contained no OCPBUGS-### keys: ${JIRA_KEYS_RAW}"
+        echo "$keys"
+        return
+    fi
+
+    if [ -n "$PR_TITLE_INPUT" ]; then
+        keys="$(extract_jira_keys "$PR_TITLE_INPUT")"
+        if [ -n "$keys" ]; then
+            echo "$keys"
+            return
+        fi
+    fi
+
+    keys="$(extract_jira_keys "$COMMIT_TITLE")"
+    if [ -n "$keys" ]; then
+        echo "$keys"
+        return
+    fi
+
+    # Try linked monorepo PR(s) for this commit (needs network / gh).
+    if command -v gh >/dev/null 2>&1; then
+        local pr_titles=""
+        if [ -n "$MONOREPO_PR" ]; then
+            pr_titles="$(gh pr view "$MONOREPO_PR" --repo "$MONOREPO_REPO" --json title -q .title 2>/dev/null || true)"
+        fi
+        if [ -z "$pr_titles" ]; then
+            pr_titles="$(gh api "repos/${MONOREPO_REPO}/commits/${FULL_SHA}/pulls" \
+                --jq '.[].title' 2>/dev/null || true)"
+        fi
+        if [ -n "$pr_titles" ]; then
+            keys="$(extract_jira_keys "$pr_titles")"
+            if [ -n "$keys" ]; then
+                echo "$keys"
+                return
+            fi
+        fi
+    fi
+    echo ""
+}
+
+# Apply provenance label; create if missing. Never apply restricted backport labels.
+apply_provenance_label() {
+    local pr_url="$1"
+    local repo="$2"
+    local label="$3"
+    [ -n "$label" ] || return 0
+
+    if ! gh label list --repo "$repo" --search "$label" --json name \
+        --jq '.[].name' 2>/dev/null | grep -qx "$label"; then
+        echo "Creating label '${label}' on ${repo} (best-effort)..."
+        gh label create "$label" --repo "$repo" \
+            --description "Outbound PR mirrored from downstream PTP monorepo" \
+            --color "0E8A16" 2>/dev/null \
+            || echo "Warning: could not create label '${label}' on ${repo} (may need openshift/release allowlist)."
+    fi
+
+    if gh pr edit "$pr_url" --add-label "$label" 2>/dev/null; then
+        echo "Applied label '${label}' on ${pr_url}"
+    else
+        echo "Warning: could not add label '${label}' on ${pr_url}. Provenance remains in title body + Monorepo-Commit trailer."
+    fi
+}
+
 # Determine commit range
 if [ -n "$COMMIT_RANGE" ]; then
     RANGE="$COMMIT_RANGE"
@@ -123,19 +278,53 @@ fi
 
 SHORT_SHA="$(git rev-parse --short=8 "$FULL_SHA")"
 COMMIT_TITLE="$(git log -1 --format='%s' "$FULL_SHA")"
+COMMIT_BODY="$(git log -1 --format='%b' "$FULL_SHA")"
 AUTHOR_NAME="$(git log -1 --format='%an' "$FULL_SHA")"
 AUTHOR_EMAIL="$(git log -1 --format='%ae' "$FULL_SHA")"
+
+JIRA_KEYS="$(resolve_jira_keys)"
+# Also scan commit body if still empty
+if [ -z "$JIRA_KEYS" ]; then
+    JIRA_KEYS="$(extract_jira_keys "$COMMIT_BODY")"
+fi
+# Prefer subject from monorepo PR title when provided (OpenShift bots validate PR titles).
+if [ -n "$PR_TITLE_INPUT" ]; then
+    SUBJECT="$(normalize_commit_subject "$PR_TITLE_INPUT")"
+else
+    SUBJECT="$(normalize_commit_subject "$COMMIT_TITLE")"
+fi
+[ -n "$SUBJECT" ] || SUBJECT="monorepo sync ${SHORT_SHA}"
+PR_TITLE="$(build_openshift_pr_title "$TARGET_BRANCH" "$SUBJECT" "$JIRA_KEYS")"
+
+# Stable topic branch when bridging an open monorepo PR (updates force-push same standalone PRs).
+if [ -n "$MONOREPO_PR" ]; then
+    TOPIC_BRANCH_BASE="sync/monorepo-${TARGET_BRANCH}-pr-${MONOREPO_PR}"
+else
+    TOPIC_BRANCH_BASE="sync/monorepo-${TARGET_BRANCH}-${SHORT_SHA}"
+fi
 
 echo "=== Outbound Monorepo to Standalone PR Bridge ==="
 echo "Monorepo Repo : ${MONOREPO_REPO}"
 echo "Base Branch   : ${TARGET_BRANCH}"
 echo "Commit Range  : ${RANGE}"
 echo "Head SHA      : ${FULL_SHA} (${SHORT_SHA})"
+echo "Monorepo PR   : ${MONOREPO_PR:-<none>}"
 echo "Commit Title  : ${COMMIT_TITLE}"
+echo "PR Title In   : ${PR_TITLE_INPUT:-<none>}"
+echo "PR Title Out  : ${PR_TITLE}"
+echo "Topic Branch  : ${TOPIC_BRANCH_BASE}"
+echo "Jira Keys     : ${JIRA_KEYS:-<none — add OCPBUGS to monorepo commit/PR or pass --jira>}"
+echo "Provenance    : label=${PROVENANCE_LABEL} (not a title prefix)"
 echo "Author        : ${AUTHOR_NAME} <${AUTHOR_EMAIL}>"
 echo "Fork Owner    : ${FORK_OWNER}"
 echo "Dry Run       : ${DRY_RUN}"
 echo "================================================"
+if [ -z "$JIRA_KEYS" ]; then
+    echo "Warning: no OCPBUGS key found. Standalone PRs may fail jira/valid-bug until retitled."
+fi
+if [ -z "$MONOREPO_PR" ]; then
+    echo "Warning: no --monorepo-pr. Prefer CI pull_request trigger so standalone PRs open before monorepo merge (Jira MODIFIED gating)."
+fi
 
 # Get modified files in the range
 CHANGED_FILES="$(git diff --name-only "$RANGE")"
@@ -158,8 +347,14 @@ else
     if echo "$CHANGED_FILES" | grep -q '^pkg/cloud-event-proxy/'; then
         COMP_ARRAY+=("cep")
     fi
-    # Check operator root files
-    if echo "$CHANGED_FILES" | grep -v '^pkg/' | grep -v '^\.tekton/' | grep -v '^\.konflux/' | grep -v '^\.github/' | grep -q .; then
+    # Check operator root files (monorepo-only paths are not standalone content)
+    if echo "$CHANGED_FILES" \
+        | grep -v '^pkg/' \
+        | grep -v '^\.tekton/' \
+        | grep -v '^\.konflux/' \
+        | grep -v '^\.github/' \
+        | grep -v '^scripts/' \
+        | grep -q .; then
         COMP_ARRAY+=("ptpop")
     fi
     DETECTED_COMPONENTS="$(IFS=,; echo "${COMP_ARRAY[*]}")"
@@ -225,7 +420,7 @@ for COMP in "${COMPS[@]}"; do
     # Extract component-specific patches (-o must precede pathspecs '--')
     if [ "$COMP" = "ptpop" ]; then
         git format-patch -o "$PATCH_DIR" "$RANGE" \
-            -- . ":(exclude)pkg" ":(exclude).tekton" ":(exclude).konflux" ":(exclude).github" >/dev/null || true
+            -- . ":(exclude)pkg" ":(exclude).tekton" ":(exclude).konflux" ":(exclude).github" ":(exclude)scripts" >/dev/null || true
     else
         git format-patch -o "$PATCH_DIR" --relative="$SUBPATH" "$RANGE" >/dev/null || true
     fi
@@ -237,11 +432,23 @@ for COMP in "${COMPS[@]}"; do
     fi
     echo "Extracted ${PATCH_COUNT} patch file(s) for ${COMPONENT_NAME}."
 
-    TOPIC_BRANCH="sync/monorepo-${TARGET_BRANCH}-${SHORT_SHA}"
-    PR_TITLE="[Monorepo Sync] ${COMMIT_TITLE}"
+    TOPIC_BRANCH="${TOPIC_BRANCH_BASE}"
+    # Same OpenShift-compliant title (and Jira key) for every component PR from this monorepo commit.
+
+    MONOREPO_PR_LINK=""
+    if [ -n "$MONOREPO_PR" ]; then
+        MONOREPO_PR_LINK="https://github.com/${MONOREPO_REPO}/pull/${MONOREPO_PR}"
+    fi
 
     PR_BODY=$(cat <<EOF
 ## Automated Sync from Downstream Monorepo
+
+Opened **while the monorepo PR is still open** so \`jira-lifecycle-plugin\` links this PR to the same OCPBUGS before any merge. The bug moves to MODIFIED only after the monorepo PR **and** all standalone PRs merge.
+
+Reuses the monorepo Jira key(s) on every standalone component PR for this branch.
+
+- **Jira:** ${JIRA_KEYS:-<none>}
+- **Monorepo PR:** ${MONOREPO_PR_LINK:-n/a}
 - **Monorepo Commit:** [\`${FULL_SHA}\`](https://github.com/${MONOREPO_REPO}/commit/${FULL_SHA})
 - **Monorepo Commit Short SHA:** \`${SHORT_SHA}\`
 - **Original Monorepo Repository:** [${MONOREPO_REPO}](https://github.com/${MONOREPO_REPO})
@@ -249,17 +456,24 @@ for COMP in "${COMPS[@]}"; do
 - **Target Component:** ${COMPONENT_NAME}
 - **Release Branch:** ${TARGET_BRANCH}
 - **Source Fork Branch:** \`${FORK_OWNER}:${TOPIC_BRANCH}\`
+- **Provenance label:** \`${PROVENANCE_LABEL}\` (do not use a title prefix)
 
 This PR was automatically generated to mirror changes from the downstream PTP monorepo for ART build consumption.
+
+### Backport merge labels (humans / QE — not applied by the bridge)
+On \`release-*\` PRs, apply \`cherry-pick-approved\` and \`backport-risk-assessed\` after review as usual. Do **not** use \`/cherry-pick\` on standalone repos; backport in the monorepo, then let this bridge open standalone PRs.
 EOF
 )
 
     PR_COMMENT=$(cat <<EOF
 ### Monorepo Provenance Traceability
 - Source Monorepo: \`${MONOREPO_REPO}\`
+- Monorepo PR: ${MONOREPO_PR_LINK:-n/a}
 - Commit SHA: [\`${FULL_SHA}\`](https://github.com/${MONOREPO_REPO}/commit/${FULL_SHA})
 - Monorepo Branch: \`${TARGET_BRANCH}\`
+- Jira (shared across component PRs): \`${JIRA_KEYS:-none}\`
 - Author: ${AUTHOR_NAME} <${AUTHOR_EMAIL}>
+- Label: \`${PROVENANCE_LABEL}\`
 EOF
 )
 
@@ -270,6 +484,7 @@ EOF
         echo "[DRY-RUN] Would push to https://github.com/${FORK_OWNER}/${REPO_NAME}.git"
         echo "[DRY-RUN] Would open PR against ${UPSTREAM_REPO} (base: ${TARGET_BRANCH}, head: ${FORK_OWNER}:${TOPIC_BRANCH})"
         echo "[DRY-RUN] PR Title: ${PR_TITLE}"
+        echo "[DRY-RUN] Would add label: ${PROVENANCE_LABEL}"
         echo "[DRY-RUN] PR Body:"
         echo "${PR_BODY}"
         echo "[DRY-RUN] Provenance PR Comment:"
@@ -320,12 +535,20 @@ Monorepo-Commit: ${FULL_SHA}\\
         git push -u fork "${TOPIC_BRANCH}" --force
     )
 
-    # Check for existing PR
+    # Check for existing PR (empty list must yield empty string — jq '.[0]|...' prints "null: null")
     echo "Checking for existing PR on ${UPSTREAM_REPO}..."
-    EXISTING_PR="$(gh pr list --repo "${UPSTREAM_REPO}" --head "${FORK_OWNER}:${TOPIC_BRANCH}" --state all --json number,url,state -q '.[0] | "\(.state): \(.url)"' || true)"
+    EXISTING_PR="$(gh pr list --repo "${UPSTREAM_REPO}" --head "${FORK_OWNER}:${TOPIC_BRANCH}" --state all \
+        --json number,url,state -q 'if length > 0 then "\(.[0].state): \(.[0].url)" else empty end' || true)"
 
-    if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+    if [ -n "$EXISTING_PR" ]; then
         echo "A Pull Request already exists for this topic branch: ${EXISTING_PR}"
+        # Keep title/body in sync when the monorepo PR is edited or new commits land.
+        EXISTING_URL="$(echo "$EXISTING_PR" | sed -E 's/^[A-Z_]+:[[:space:]]*//')"
+        if [[ "$EXISTING_URL" == https://* ]]; then
+            gh pr edit "$EXISTING_URL" --title "${PR_TITLE}" --body "${PR_BODY}" 2>/dev/null \
+                || echo "Warning: could not refresh title/body on ${EXISTING_URL}"
+            apply_provenance_label "${EXISTING_URL}" "${UPSTREAM_REPO}" "${PROVENANCE_LABEL}"
+        fi
     else
         echo "Creating cross-repository Pull Request on ${UPSTREAM_REPO}..."
         CREATED_PR_URL="$(gh pr create \
@@ -336,6 +559,8 @@ Monorepo-Commit: ${FULL_SHA}\\
             --body "${PR_BODY}")"
 
         echo "Pull Request created successfully: ${CREATED_PR_URL}"
+
+        apply_provenance_label "${CREATED_PR_URL}" "${UPSTREAM_REPO}" "${PROVENANCE_LABEL}"
 
         echo "Posting provenance traceability comment..."
         gh pr comment "${CREATED_PR_URL}" --body "${PR_COMMENT}" || echo "Warning: failed to post comment on ${CREATED_PR_URL}"
