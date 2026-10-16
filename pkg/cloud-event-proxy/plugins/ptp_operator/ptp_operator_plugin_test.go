@@ -1,0 +1,822 @@
+// Copyright 2020 The Cloud Native Events Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build unittests
+// +build unittests
+
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	v2 "github.com/cloudevents/sdk-go/v2"
+	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	ptpConfig "github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/config"
+	event2 "github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/event"
+	"github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/metrics"
+	"github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/ptp4lconf"
+	"github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/stats"
+	"github.com/redhat-cne/sdk-go/pkg/event"
+	"github.com/redhat-cne/sdk-go/pkg/types"
+	"k8s.io/utils/pointer"
+
+	"github.com/redhat-cne/cloud-event-proxy/pkg/common"
+	ptpTypes "github.com/redhat-cne/cloud-event-proxy/plugins/ptp_operator/types"
+	restapi "github.com/redhat-cne/rest-api/v2"
+	"github.com/redhat-cne/sdk-go/pkg/channel"
+	ptpEvent "github.com/redhat-cne/sdk-go/pkg/event/ptp"
+	v1event "github.com/redhat-cne/sdk-go/v1/event"
+	"github.com/stretchr/testify/assert"
+
+	v1pubsub "github.com/redhat-cne/sdk-go/v1/pubsub"
+	subscriberApi "github.com/redhat-cne/sdk-go/v1/subscriber"
+)
+
+var (
+	wg                sync.WaitGroup
+	server            *restapi.Server
+	scConfig          *common.SCConfiguration
+	channelBufferSize int = 10
+	storePath             = "../../.."
+	apiPort           int = 8990
+	c                 chan os.Signal
+	pubsubTypes       map[ptpEvent.EventType]*ptpTypes.EventPublisherType
+	nodeName          = "test_node"
+)
+
+func freeTCPPort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port, nil
+}
+
+func uniqueStorePath(prefix string) (string, error) {
+	base := os.TempDir()
+	if sPath, ok := os.LookupEnv("STORE_PATH"); ok && sPath != "" {
+		base = sPath
+	}
+	return os.MkdirTemp(base, prefix)
+}
+
+func TestMain(m *testing.M) {
+	defer cleanUP()
+	var err error
+	storePath, err = uniqueStorePath("ptp-operator-plugin-*")
+	if err != nil {
+		log.Fatalf("unique store path: %v", err)
+	}
+	defer os.RemoveAll(storePath)
+
+	apiPort, err = freeTCPPort()
+	if err != nil {
+		log.Fatalf("free tcp port: %v", err)
+	}
+	scConfig = &common.SCConfiguration{
+		EventInCh:     make(chan *channel.DataChan, channelBufferSize),
+		EventOutCh:    make(chan *channel.DataChan, channelBufferSize),
+		CloseCh:       make(chan struct{}),
+		APIPort:       apiPort,
+		APIPath:       "/api/ocloudNotifications/v2/",
+		PubSubAPI:     v1pubsub.GetAPIInstance(storePath),
+		SubscriberAPI: subscriberApi.GetAPIInstance(storePath),
+		StorePath:     storePath,
+		TransportHost: &common.TransportHost{
+			Type: common.HTTP,
+			URL:  fmt.Sprintf("localhost:%d", apiPort),
+			Host: "localhost",
+			Port: apiPort,
+			Err:  nil,
+		},
+		BaseURL: nil,
+	}
+
+	c = make(chan os.Signal)
+	cleanUP()
+	common.StartPubSubService(scConfig)
+	pubsubTypes = InitPubSubTypes()
+	scConfig.RestAPI.SetOnStatusReceiveOverrideFn(getMockOverrideFn())
+	code := m.Run()
+	// os exit skips defer
+	cleanUP()
+	_ = os.RemoveAll(storePath)
+	os.Exit(code)
+}
+func cleanUP() {
+	if scConfig == nil {
+		return
+	}
+	if scConfig.SubscriberAPI != nil {
+		_, _ = scConfig.SubscriberAPI.DeleteAllSubscriptions()
+	}
+	if scConfig.PubSubAPI != nil {
+		_ = scConfig.PubSubAPI.DeleteAllPublishers()
+	}
+}
+
+// ProcessInChannel will be  called if Transport is disabled
+func ProcessInChannel() {
+	for { //nolint:gosimple
+		select {
+		case d := <-scConfig.EventInCh:
+			if d.Type == channel.SUBSCRIBER {
+				log.Printf("transport disabled,no action taken: request to create listener address %s was called,but transport is not enabled", d.Address)
+			} else if d.Type == channel.PUBLISHER {
+				log.Printf("no action taken: request to create sender for address %s was called,but transport is not enabled", d.Address)
+			} else if d.Type == channel.EVENT && d.Status == channel.NEW {
+				out := channel.DataChan{
+					Address:        d.Address,
+					Data:           d.Data,
+					Status:         channel.SUCCESS,
+					Type:           channel.EVENT,
+					ProcessEventFn: d.ProcessEventFn,
+				}
+				if d.OnReceiveOverrideFn != nil {
+					if err := d.OnReceiveOverrideFn(*d.Data, &out); err != nil {
+						out.Status = channel.FAILED
+					} else {
+						out.Status = channel.SUCCESS
+					}
+				}
+				scConfig.EventOutCh <- &out
+			}
+		case <-scConfig.CloseCh:
+			return
+		}
+	}
+}
+
+func TestGetCurrentStatOverrideFn(t *testing.T) {
+	// Setup
+	//CLIENT SUBSCRIPTION: create a subscription to consume events
+
+	var err error
+	endpointURL := fmt.Sprintf("%s%s", scConfig.BaseURL, "dummy")
+	for _, pTypes := range pubsubTypes {
+		pub := v1pubsub.NewPubSub(types.ParseURI(endpointURL), path.Join(resourcePrefix, nodeName, string(pTypes.Resource)))
+		pub, err = common.CreatePublisher(scConfig, pub)
+		assert.Nil(t, err)
+		assert.NotEmpty(t, pub.ID)
+		assert.NotEmpty(t, pub.URILocation)
+		pTypes.PubID = pub.ID
+		pTypes.Pub = &pub
+	}
+	assert.Equal(t, 7, len(pubsubTypes))
+	eventManager = metrics.NewPTPEventManager("/cluster/node", pubsubTypes, nodeName, scConfig)
+	eventManager.MockTest(true)
+
+	tests := []struct {
+		name                    string
+		eventSource             ptpEvent.EventResource
+		eventType               ptpEvent.EventType
+		expectedSyncState       ptpTypes.SyncState
+		expectedResourceAddress string
+		statsData               []statsData
+		depsClockState          []event2.ClockState
+	}{
+		{
+			name:                    "PTP State is Locked - Single Event",
+			expectedSyncState:       ptpTypes.LOCKED,
+			eventSource:             ptpEvent.PtpLockState,
+			eventType:               ptpEvent.PtpStateChange,
+			expectedResourceAddress: fmt.Sprintf("/cluster/node/%s/%s/%s", nodeName, "ens1fx", MasterClockType),
+			statsData: []statsData{
+				{clockType: MasterClockType, configName: "ptp4l.0.config", processName: "ptp4l", alias: "ens1fx", iface: "ens1f0", syncState: ptpEvent.LOCKED},
+			},
+		},
+		{
+			name:                    "OS CLOCK event not found",
+			expectedSyncState:       ptpTypes.FREERUN,
+			eventSource:             ptpEvent.OsClockSyncState,
+			eventType:               ptpEvent.OsClockSyncStateChange,
+			expectedResourceAddress: fmt.Sprintf("/cluster/node/%s/%s", nodeName, "event-not-found"),
+			statsData: []statsData{
+				{clockType: MasterClockType, configName: "ptp4l.0.config", processName: "phc2sys", alias: "ens1fx", iface: "ens1f0", syncState: ptpEvent.LOCKED},
+			},
+		},
+		{
+			name:                    "OS CLOCK is Locked - Single Event",
+			expectedSyncState:       ptpTypes.LOCKED,
+			eventSource:             ptpEvent.OsClockSyncState,
+			eventType:               ptpEvent.OsClockSyncStateChange,
+			expectedResourceAddress: fmt.Sprintf("/cluster/node/%s/%s", nodeName, ClockRealTime),
+			statsData: []statsData{
+				{clockType: ClockRealTime, configName: "ptp4l.0.config", processName: "phc2sys", alias: "", iface: "", syncState: ptpEvent.LOCKED},
+			},
+		},
+		{
+			name:                    "SyncStatusState := LOCKED Master + FREERUN OS",
+			eventSource:             ptpEvent.SyncStatusState,
+			eventType:               ptpEvent.SyncStateChange,
+			expectedSyncState:       ptpTypes.FREERUN,
+			expectedResourceAddress: fmt.Sprintf("/cluster/node/%s%s", nodeName, ptpEvent.SyncStatusState),
+			statsData: []statsData{
+				{clockType: MasterClockType, configName: "ptp4l.0.config", processName: "ptp4l", alias: "ens1fx", iface: "ens1f0", syncState: ptpEvent.LOCKED},
+				{clockType: ClockRealTime, configName: "ptp4l.0.config", processName: "phc2sys", syncState: ptpEvent.FREERUN},
+			},
+		},
+		{
+			name:                    "SyncStatusState:= FREERUN Master + FREERUN OS",
+			eventSource:             ptpEvent.SyncStatusState,
+			eventType:               ptpEvent.SyncStateChange,
+			expectedSyncState:       ptpTypes.FREERUN,
+			expectedResourceAddress: fmt.Sprintf("/cluster/node/%s%s", nodeName, ptpEvent.SyncStatusState),
+			statsData: []statsData{
+				{clockType: MasterClockType, configName: "ptp4l.0.config", processName: "ptp4l", alias: "ens1fx", iface: "ens1f0", syncState: ptpEvent.FREERUN},
+				{clockType: ClockRealTime, configName: "ptp4l.0.config", processName: "phc2sys", syncState: ptpEvent.FREERUN},
+			},
+		},
+		{
+			name:                    "SyncStatusState:= LOCKED Master + LOCKED OS",
+			eventSource:             ptpEvent.SyncStatusState,
+			eventType:               ptpEvent.SyncStateChange,
+			expectedSyncState:       ptpTypes.LOCKED,
+			expectedResourceAddress: fmt.Sprintf("/cluster/node/%s%s", nodeName, ptpEvent.SyncStatusState),
+			statsData: []statsData{
+				{clockType: MasterClockType, configName: "ptp4l.0.config", processName: "ptp4l", alias: "ens1fx", iface: "ens1f0", syncState: ptpEvent.LOCKED},
+				{clockType: ClockRealTime, configName: "ptp4l.0.config", processName: "phc2sys", syncState: ptpEvent.LOCKED},
+			},
+		},
+		{
+			name:                    "SyncStatusState:= T-GM everything is  locked ",
+			eventSource:             ptpEvent.SyncStatusState,
+			eventType:               ptpEvent.SyncStateChange,
+			expectedSyncState:       ptpTypes.LOCKED,
+			expectedResourceAddress: fmt.Sprintf("/cluster/node/%s%s", nodeName, ptpEvent.SyncStatusState),
+			statsData: []statsData{
+				{clockType: MasterClockType, configName: "ptp4l.0.config", processName: "ptp4l", alias: "ens1fx", iface: "ens1f0", syncState: ptpEvent.LOCKED},
+				{clockType: ClockRealTime, configName: "ptp4l.0.config", processName: "phc2sys", syncState: ptpEvent.LOCKED},
+			},
+			depsClockState: []event2.ClockState{
+				{ClockSource: event2.GNSS, Process: gnssProcessName, Offset: pointer.Float64(1.0), IFace: pointer.String("ens1f0"), State: ptpEvent.LOCKED},
+				{ClockSource: event2.DPLL, Process: "dpll", Offset: pointer.Float64(1.0), IFace: pointer.String("ens1f0"), State: ptpEvent.LOCKED},
+				{ClockSource: event2.GM, Process: "gm", Offset: pointer.Float64(1.0), IFace: pointer.String("ens1f0"), State: ptpEvent.LOCKED},
+			},
+		},
+		{
+			name:                    "SyncStatusState:= T-GM everything is  locked ",
+			eventSource:             ptpEvent.SyncStatusState,
+			eventType:               ptpEvent.SyncStateChange,
+			expectedSyncState:       ptpTypes.FREERUN,
+			expectedResourceAddress: fmt.Sprintf("/cluster/node/%s%s", nodeName, ptpEvent.SyncStatusState),
+			statsData: []statsData{
+				{clockType: MasterClockType, configName: "ptp4l.0.config", processName: "ptp4l", alias: "ens1fx", iface: "ens1f0", syncState: ptpEvent.LOCKED},
+				{clockType: ClockRealTime, configName: "ptp4l.0.config", processName: "phc2sys", syncState: ptpEvent.FREERUN},
+			},
+			depsClockState: []event2.ClockState{
+				{ClockSource: event2.GNSS, Process: gnssProcessName, Offset: pointer.Float64(1.0), IFace: pointer.String("ens1f0"), State: ptpEvent.LOCKED},
+				{ClockSource: event2.DPLL, Process: "dpll", Offset: pointer.Float64(1.0), IFace: pointer.String("ens1f0"), State: ptpEvent.LOCKED},
+				{ClockSource: event2.GM, Process: "gm", Offset: pointer.Float64(1.0), IFace: pointer.String("ens1f0"), State: ptpEvent.LOCKED},
+			},
+		},
+		{
+			name:                    "SyncStatusState:= T-GM not everything is locked ",
+			eventSource:             ptpEvent.SyncStatusState,
+			eventType:               ptpEvent.SyncStateChange,
+			expectedSyncState:       ptpTypes.LOCKED,
+			expectedResourceAddress: fmt.Sprintf("/cluster/node/%s%s", nodeName, ptpEvent.SyncStatusState),
+			statsData: []statsData{
+				{clockType: MasterClockType, configName: "ptp4l.0.config", processName: "ptp4l", alias: "ens1fx", iface: "ens1f0", syncState: ptpEvent.LOCKED},
+				{clockType: ClockRealTime, configName: "ptp4l.0.config", processName: "phc2sys", syncState: ptpEvent.LOCKED},
+			},
+			depsClockState: []event2.ClockState{
+				{ClockSource: event2.GNSS, Process: gnssProcessName, Offset: pointer.Float64(1.0), IFace: pointer.String("ens1f0"), State: ptpEvent.LOCKED},
+				{ClockSource: event2.DPLL, Process: "dpll", Offset: pointer.Float64(1.0), IFace: pointer.String("ens1f0"), State: ptpEvent.FREERUN},
+				{ClockSource: event2.GM, Process: "gm", Offset: pointer.Float64(1.0), IFace: pointer.String("ens1f0"), State: ptpEvent.LOCKED},
+			},
+		},
+	}
+
+	// Iterate over test cases
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			event := buildEvent(nodeName, tt.eventSource, tt.eventType)
+			eventManager.Stats = getStats(tt.statsData, tt.depsClockState)
+
+			// Initialize Stats object
+			// Invoke the function
+			// Mock input
+			mockDataChan := &channel.DataChan{
+				ClientID: uuid.MustParse("123e4567-e89b-12d3-a456-426614174000"),
+			}
+
+			overrideFn := getCurrentStatOverrideFn()
+			err := overrideFn(event, mockDataChan)
+
+			// Assertions
+			assert.NoError(t, err, "Expected no error from getCurrentStatOverrideFn")
+			assert.NotNil(t, mockDataChan.Data, "Expected DataChan.Data to be populated")
+			eventReceived, err2 := v1event.GetCloudNativeEvents(*mockDataChan.Data)
+
+			assert.Nil(t, err2)
+			assert.Equal(t, tt.expectedSyncState.String(), eventReceived.Data.Values[0].Value, "Expected SyncState to match event state")
+			assert.Equal(t, tt.expectedResourceAddress, eventReceived.Data.Values[0].Resource, "Expected resource to match expected resource")
+			expectedReturnAddr := fmt.Sprintf("/cluster/node/%s%s", nodeName, string(tt.eventSource))
+			assert.Equal(t, expectedReturnAddr, *mockDataChan.ReturnAddress)
+		})
+	}
+}
+
+func TestGetCurrentStatOverrideFnConcurrentMapAccess(t *testing.T) {
+	eventManager = metrics.NewPTPEventManager("/cluster/node", pubsubTypes, nodeName, scConfig)
+	eventManager.MockTest(true)
+
+	event := buildEvent(nodeName, ptpEvent.PtpLockState, ptpEvent.PtpStateChange)
+	sData := []statsData{
+		{clockType: MasterClockType, configName: "ptp4l.0.config", processName: "ptp4l", alias: "ens1fx", iface: "ens1f0", syncState: ptpEvent.LOCKED},
+		{clockType: ClockRealTime, configName: "ptp4l.0.config", processName: "phc2sys", syncState: ptpEvent.FREERUN},
+	}
+
+	eventManager.Stats = getStats(sData, nil)
+	mockDataChan := &channel.DataChan{
+		ClientID: uuid.MustParse("123e4567-e89b-12d3-a456-426614174000"),
+	}
+	overrideFn := getCurrentStatOverrideFn()
+
+	// Function to simulate concurrent reads
+	readFunc := func(wg *sync.WaitGroup) {
+		defer wg.Done()
+		overrideFn(event, mockDataChan)
+	}
+
+	var wg sync.WaitGroup
+	numGoroutines := 1000
+
+	// Start multiple goroutines to read the map
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go readFunc(&wg)
+	}
+	// Wait for all goroutines to finish
+	wg.Wait()
+}
+
+// Define the struct to match the JSON structure
+
+type statsData struct {
+	clockType   string
+	configName  string
+	alias       string
+	iface       string
+	processName string
+	syncState   ptpEvent.SyncState
+}
+
+func getStats(statsData []statsData, depsClockState []event2.ClockState) map[ptpTypes.ConfigName]stats.PTPStats {
+	s := make(map[ptpTypes.ConfigName]stats.PTPStats)
+
+	for index, statsObj := range statsData {
+
+		if _, found := s[ptpTypes.ConfigName(statsObj.configName)]; !found {
+			s[ptpTypes.ConfigName(statsObj.configName)] = make(stats.PTPStats)
+		}
+		if _, found := s[ptpTypes.ConfigName(statsObj.configName)][ptpTypes.IFace(statsObj.clockType)]; !found {
+			s[ptpTypes.ConfigName(statsObj.configName)][ptpTypes.IFace(statsObj.clockType)] = stats.NewStats(string(statsObj.clockType))
+			s[ptpTypes.ConfigName(statsObj.configName)][ptpTypes.IFace(statsObj.clockType)].SetOffsetSource(statsObj.processName)
+			s[ptpTypes.ConfigName(statsObj.configName)][ptpTypes.IFace(statsObj.clockType)].SetAlias(statsObj.alias)
+			s[ptpTypes.ConfigName(statsObj.configName)][ptpTypes.IFace(statsObj.clockType)].SetProcessName(statsObj.processName)
+			s[ptpTypes.ConfigName(statsObj.configName)][ptpTypes.IFace(statsObj.clockType)].SetLastSyncState(statsObj.syncState)
+
+			// Loop through depsClockState and call SetPtpDependentEventState for each ClockState
+			if index == 0 {
+				for _, clockState := range depsClockState {
+					s[ptpTypes.ConfigName(statsObj.configName)][ptpTypes.IFace(statsObj.clockType)].SetPtpDependentEventState(
+						clockState,
+						map[string]*event2.PMetric{
+							"metric1": {},
+						},
+						map[string]string{
+							"metric1": "Metric 1 description",
+						},
+					)
+				}
+			}
+		}
+
+	}
+	return s
+}
+
+func getDeps(state ptpEvent.SyncState, iface, processName string) event2.ClockState {
+	return event2.ClockState{
+		State:   state,
+		Offset:  pointer.Float64(5.0),
+		IFace:   pointer.String(iface),
+		Process: processName,
+	}
+
+}
+
+func ConvertToEvent(dataEncoded []byte) (*event.Event, error) {
+	// Unmarshal the JSON data into the Event struct
+	var event event.Event
+	err := json.Unmarshal(dataEncoded, &event)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshaling JSON: %w", err)
+	}
+	return &event, nil
+}
+
+func buildEvent(node string, source ptpEvent.EventResource, eventType ptpEvent.EventType) v2.Event {
+	e := v2.NewEvent()
+	e.SetSource(fmt.Sprintf("/cluster/node/%s%s", node, string(source)))
+	e.SetType(string(eventType))
+	return e
+}
+
+// startMockLogsServer starts a minimal HTTP server on the logsEndpoint port
+// (8081) so that eventManager.TriggerLogs() succeeds during tests.
+// Returns a cleanup function that shuts down the server.
+func startMockLogsServer(t *testing.T) func() {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/emit-logs", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	const mockLogsAddr = "127.0.0.1:8081"
+	srv := &http.Server{Addr: mockLogsAddr, Handler: mux}
+	var ln net.Listener
+	var err error
+	for i := 0; i < 10; i++ {
+		ln, err = net.Listen("tcp", mockLogsAddr)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("failed to listen on %s for mock logs server: %v", mockLogsAddr, err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	return func() { _ = srv.Close() }
+}
+
+// setupProcessMessages prepares the globals that processMessages depends on.
+// eventManager is configured in mock-test mode.
+func setupProcessMessages(t *testing.T) func() {
+	t.Helper()
+	oldEventManager := eventManager
+
+	scCfg := &common.SCConfiguration{}
+	eventManager = metrics.NewPTPEventManager(resourcePrefix, pubsubTypes, nodeName, scCfg)
+	eventManager.MockTest(true)
+
+	return func() {
+		eventManager = oldEventManager
+		triggerLogsOnce = sync.Once{}
+	}
+}
+
+func TestProcessMessages_LiveStartSkipped(t *testing.T) {
+	cleanup := startMockLogsServer(t)
+	defer cleanup()
+	restore := setupProcessMessages(t)
+	defer restore()
+
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		processMessages(serverConn)
+		close(done)
+	}()
+
+	_, err := fmt.Fprintf(clientConn, "%s\n", liveStartCommand)
+	assert.NoError(t, err)
+	_ = clientConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("processMessages did not return after CMD LIVE_START + EOF")
+	}
+}
+
+func TestProcessMessages_LiveStartBetweenRegularMessages(t *testing.T) {
+	cleanup := startMockLogsServer(t)
+	defer cleanup()
+	restore := setupProcessMessages(t)
+	defer restore()
+
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		processMessages(serverConn)
+		close(done)
+	}()
+
+	msgs := []string{
+		"ptp4l[123.456]: [ptp4l.0.config] master offset  5 s2 freq -1000 path delay 100",
+		liveStartCommand,
+		"ptp4l[123.457]: [ptp4l.0.config] master offset  3 s2 freq  -998 path delay  99",
+		liveStartCommand,
+		"phc2sys[123.458]: [ptp4l.0.config] CLOCK_REALTIME phc offset  10 s2 freq -500 delay 200",
+	}
+	for _, m := range msgs {
+		_, err := fmt.Fprintf(clientConn, "%s\n", m)
+		assert.NoError(t, err)
+	}
+	_ = clientConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("processMessages did not return after mixed LIVE_START and regular messages")
+	}
+}
+
+func TestProcessMessages_TriggerLogsFailureNonBlocking(t *testing.T) {
+	// No mock HTTP server → TriggerLogs will fail, but since it's async
+	// the scanner should still process messages on this connection.
+	restore := setupProcessMessages(t)
+	defer restore()
+
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		processMessages(serverConn)
+		close(done)
+	}()
+
+	// Even though TriggerLogs fails (no HTTP server), processMessages must
+	// still read from the connection because TriggerLogs is async.
+	_, err := fmt.Fprintf(clientConn, "%s\n", liveStartCommand)
+	assert.NoError(t, err)
+	_ = clientConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("processMessages should still process messages when TriggerLogs fails async")
+	}
+}
+
+func TestProcessMessages_MultipleLiveStartOnly(t *testing.T) {
+	cleanup := startMockLogsServer(t)
+	defer cleanup()
+	restore := setupProcessMessages(t)
+	defer restore()
+
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		processMessages(serverConn)
+		close(done)
+	}()
+
+	for i := 0; i < 5; i++ {
+		_, err := fmt.Fprintf(clientConn, "%s\n", liveStartCommand)
+		assert.NoError(t, err)
+	}
+	_ = clientConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("processMessages did not return after multiple CMD LIVE_START messages")
+	}
+}
+
+func TestLiveStartCommand_ConstantValue(t *testing.T) {
+	assert.Equal(t, "CMD LIVE_START", liveStartCommand)
+	assert.NotEqual(t, restartCommand, liveStartCommand,
+		"LIVE_START and RESTART must be distinct commands")
+	assert.True(t, strings.HasPrefix(liveStartCommand, "CMD "),
+		"control commands should use CMD prefix to distinguish from log lines")
+}
+
+// TestCurrentState_ChronydSkipsStalePhc2sysClockRealtime verifies that
+// the CurrentState handler only returns the chronyd-managed CLOCK_REALTIME
+// when chronyd is enabled, ignoring the stale phc2sys FREERUN entry.
+func TestCurrentState_ChronydSkipsStalePhc2sysClockRealtime(t *testing.T) {
+	profileName := "ntp-failover"
+	ptp4lCfgName := "ptp4l.0.config"
+	chronydCfgName := "chronyd.0.config"
+
+	eventManager = metrics.NewPTPEventManager("/cluster/node", pubsubTypes, nodeName, scConfig)
+	eventManager.MockTest(true)
+
+	// Register ptp4l config with the profile
+	eventManager.AddPTPConfig(ptpTypes.ConfigName(ptp4lCfgName), &ptp4lconf.PTP4lConfig{
+		Name:    ptp4lCfgName,
+		Profile: profileName,
+		Interfaces: []*ptp4lconf.PTPInterface{
+			{Name: "ens3f0", PortID: 1, PortName: "port 1", Role: ptpTypes.SLAVE},
+		},
+	})
+
+	// Register chronyd config with the same profile
+	eventManager.AddPTPConfig(ptpTypes.ConfigName(chronydCfgName), &ptp4lconf.PTP4lConfig{
+		Name:    chronydCfgName,
+		Profile: profileName,
+	})
+
+	// Set up PtpProcessOpts with chronyd enabled (simulating the production path)
+	phc2sysOpts := "-a -r -r -n 24"
+	chronydOpts := "-f /etc/chrony.conf"
+	eventManager.PtpConfigMapUpdates.PtpProcessOpts = map[string]*ptpConfig.PtpProcessOpts{
+		profileName: {
+			Phc2Opts:    &phc2sysOpts,
+			ChronydOpts: &chronydOpts,
+		},
+	}
+
+	// Set up stats: ptp4l config has stale phc2sys FREERUN for CLOCK_REALTIME
+	ptp4lStats := eventManager.GetStats(ptpTypes.ConfigName(ptp4lCfgName))
+	ptp4lStats.CheckSource(metrics.ClockRealTime, ptp4lCfgName, "phc2sys")
+	ptp4lStats[metrics.ClockRealTime].SetLastSyncState(ptpEvent.FREERUN)
+	ptp4lStats[metrics.ClockRealTime].SetProcessName("phc2sys")
+
+	// Set up stats: chronyd config has authoritative LOCKED for CLOCK_REALTIME
+	chronydStats := eventManager.GetStats(ptpTypes.ConfigName(chronydCfgName))
+	chronydStats.CheckSource(metrics.ClockRealTime, chronydCfgName, "chronyd")
+	chronydStats[metrics.ClockRealTime].SetLastSyncState(ptpEvent.LOCKED)
+	chronydStats[metrics.ClockRealTime].SetProcessName("chronyd")
+
+	// Request OsClockSyncState CurrentState
+	ev := buildEvent(nodeName, ptpEvent.OsClockSyncState, ptpEvent.OsClockSyncStateChange)
+	mockDataChan := &channel.DataChan{
+		ClientID: uuid.MustParse("123e4567-e89b-12d3-a456-426614174000"),
+	}
+	overrideFn := getCurrentStatOverrideFn()
+	err := overrideFn(ev, mockDataChan)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, mockDataChan.Data)
+
+	eventReceived, err2 := v1event.GetCloudNativeEvents(*mockDataChan.Data)
+	assert.Nil(t, err2)
+
+	// Should have values from only ONE CLOCK_REALTIME source (chronyd, LOCKED).
+	// GetPTPEventsData adds 2 DataValues per source (NOTIFICATION + METRIC).
+	assert.Equal(t, 2, len(eventReceived.Data.Values),
+		"Should have exactly 2 DataValues (one source: chronyd only)")
+	assert.Equal(t, string(ptpEvent.LOCKED), eventReceived.Data.Values[0].Value,
+		"CLOCK_REALTIME state should be LOCKED (from chronyd, not stale phc2sys FREERUN)")
+}
+
+// TestCurrentState_NoChronydIncludesPhc2sysClockRealtime verifies that
+// when chronyd is NOT enabled, the standard phc2sys CLOCK_REALTIME is returned.
+func TestCurrentState_NoChronydIncludesPhc2sysClockRealtime(t *testing.T) {
+	profileName := "ptp-oc"
+	ptp4lCfgName := "ptp4l.0.config"
+
+	eventManager = metrics.NewPTPEventManager("/cluster/node", pubsubTypes, nodeName, scConfig)
+	eventManager.MockTest(true)
+
+	eventManager.AddPTPConfig(ptpTypes.ConfigName(ptp4lCfgName), &ptp4lconf.PTP4lConfig{
+		Name:    ptp4lCfgName,
+		Profile: profileName,
+		Interfaces: []*ptp4lconf.PTPInterface{
+			{Name: "ens3f0", PortID: 1, PortName: "port 1", Role: ptpTypes.SLAVE},
+		},
+	})
+
+	phc2sysOpts := "-a -r -r -n 24"
+	eventManager.PtpConfigMapUpdates.PtpProcessOpts = map[string]*ptpConfig.PtpProcessOpts{
+		profileName: {
+			Phc2Opts: &phc2sysOpts,
+		},
+	}
+
+	ptp4lStats := eventManager.GetStats(ptpTypes.ConfigName(ptp4lCfgName))
+	ptp4lStats.CheckSource(metrics.ClockRealTime, ptp4lCfgName, "phc2sys")
+	ptp4lStats[metrics.ClockRealTime].SetLastSyncState(ptpEvent.LOCKED)
+	ptp4lStats[metrics.ClockRealTime].SetProcessName("phc2sys")
+
+	ev := buildEvent(nodeName, ptpEvent.OsClockSyncState, ptpEvent.OsClockSyncStateChange)
+	mockDataChan := &channel.DataChan{
+		ClientID: uuid.MustParse("123e4567-e89b-12d3-a456-426614174000"),
+	}
+	overrideFn := getCurrentStatOverrideFn()
+	err := overrideFn(ev, mockDataChan)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, mockDataChan.Data)
+
+	eventReceived, err2 := v1event.GetCloudNativeEvents(*mockDataChan.Data)
+	assert.Nil(t, err2)
+
+	// GetPTPEventsData adds 2 DataValues per source (NOTIFICATION + METRIC).
+	assert.Equal(t, 2, len(eventReceived.Data.Values),
+		"Should have exactly 2 DataValues (one source: phc2sys)")
+	assert.Equal(t, string(ptpEvent.LOCKED), eventReceived.Data.Values[0].Value,
+		"CLOCK_REALTIME state should be LOCKED from phc2sys")
+}
+
+func getMockOverrideFn() func(e v2.Event, d *channel.DataChan) error {
+	return func(e v2.Event, d *channel.DataChan) error {
+		if e.Source() != "" {
+			d.ReturnAddress = pointer.String(e.Source())
+		}
+
+		var eventType ptpEvent.EventType
+		var eventSource ptpEvent.EventResource
+
+		switch {
+		case strings.Contains(e.Source(), string(ptpEvent.PtpLockState)):
+			eventType = ptpEvent.PtpStateChange
+			eventSource = ptpEvent.PtpLockState
+		case strings.Contains(e.Source(), string(ptpEvent.OsClockSyncState)):
+			eventType = ptpEvent.OsClockSyncStateChange
+			eventSource = ptpEvent.OsClockSyncState
+		case strings.Contains(e.Source(), string(ptpEvent.PtpClockClass)):
+			eventType = ptpEvent.PtpClockClassChange
+			eventSource = ptpEvent.PtpClockClass
+		case strings.Contains(e.Source(), string(ptpEvent.PtpClockClassV1)):
+			eventType = ptpEvent.PtpClockClassChange
+			eventSource = ptpEvent.PtpClockClassV1
+		case strings.Contains(e.Source(), string(ptpEvent.GnssSyncStatus)):
+			eventType = ptpEvent.GnssStateChange
+			eventSource = ptpEvent.GnssSyncStatus
+		case strings.Contains(e.Source(), string(ptpEvent.SyncStatusState)):
+			eventType = ptpEvent.SyncStateChange
+			eventSource = ptpEvent.SyncStatusState
+		case strings.Contains(e.Source(), string(ptpEvent.SyncStatusState)):
+			eventType = ptpEvent.SynceStateChange
+			eventSource = ptpEvent.SyncStatusState
+		case strings.Contains(e.Source(), string(ptpEvent.SynceClockQuality)):
+			eventType = ptpEvent.SynceClockQualityChange
+			eventSource = ptpEvent.SynceClockQuality
+		default:
+			return fmt.Errorf("mock: unsupported event source: %s", e.Source())
+		}
+
+		// Create dummy event data
+		data := &event.Data{
+			Version: "1.0",
+			Values: []event.DataValue{
+				{
+					Resource:  fmt.Sprintf("/mock/resource/%s", eventSource),
+					Value:     ptpEvent.LOCKED,
+					ValueType: event.ENUMERATION,
+					DataType:  event.NOTIFICATION,
+				},
+			},
+		}
+
+		// Encode to CloudEvent format
+		evts, err := eventManager.GetPTPCloudEvents(*data, eventType)
+		if err != nil {
+			return fmt.Errorf("mock: failed to get cloud event: %w", err)
+		}
+		evts.SetSource(string(eventSource))
+		d.Data = evts
+
+		return nil
+	}
+}
+
+func TestSetThresholdMetrics(t *testing.T) {
+	metrics.Threshold.Reset()
+	thresholds := map[string]*ptpConfig.PtpClockThreshold{
+		"test-profile": {
+			MaxOffsetThreshold: 100,
+			MinOffsetThreshold: -100,
+			HoldOverTimeout:    5,
+		},
+	}
+	setThresholdMetrics("test-node", thresholds)
+
+	testCases := []struct {
+		threshold string
+		expected  float64
+	}{
+		{"MinOffsetThreshold", -100},
+		{"MaxOffsetThreshold", 100},
+		{"HoldOverTimeout", 5},
+	}
+	for _, tc := range testCases {
+		g, err := metrics.Threshold.GetMetricWith(map[string]string{
+			"threshold": tc.threshold, "node": "test-node", "profile": "test-profile",
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, g)
+		assert.Equal(t, tc.expected, testutil.ToFloat64(g), "metric value for %s", tc.threshold)
+	}
+}
