@@ -1,0 +1,8 @@
+name: "ptp-operator: netdevsim CI"
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  netdevsim-ci:
+    uses: redhat-cne/ptp-netdevsim-ci/.github/workflows/netdevsim.yml@main
