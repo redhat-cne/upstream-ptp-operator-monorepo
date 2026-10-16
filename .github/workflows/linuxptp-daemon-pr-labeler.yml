@@ -1,0 +1,15 @@
+name: "Pull Request Labeler"
+on:
+  - pull_request_target
+
+jobs:
+  triage:
+    if: false  # This prevents the job from running
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pkg/linuxptp-daemon
+    steps:
+      - uses: actions/labeler@v3
+        with:
+          repo-token: "${{ secrets.GITHUB_TOKEN }}"

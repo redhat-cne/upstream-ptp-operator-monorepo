@@ -1,0 +1,18 @@
+name: "linuxptp-daemon: Close Stale Issues and PRs"
+on:
+  schedule:
+    - cron: '30 1 * * *'
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pkg/linuxptp-daemon
+    steps:
+      - uses: actions/stale@v9
+        with:
+          stale-issue-message: 'This issue is stale because it has been open 90 days with no activity. Remove stale label or comment or this will be closed in 7 days.'
+          stale-pr-message: 'This pull request is stale because it has been open 90 days with no activity. Remove stale label or comment or this will be closed in 7 days.'
+          days-before-stale: 90
+          days-before-close: 7
